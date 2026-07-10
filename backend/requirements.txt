@@ -8,3 +8,11 @@ requests==2.32.3
 websockets==12.0
 pydantic==2.7.4
 cryptography==42.0.8
+
+# Kotak Neo broker support. Installed from git since it's not on PyPI:
+#   pip install "git+https://github.com/Kotak-Neo/Kotak-neo-api-v2.git@v2.0.2#egg=neo_api_client"
+# NOTE: neo_api_client's setup pins websockets==8.1 (for its own live-feed subscribe() feature,
+# which this app doesn't use), and installing it will downgrade the websockets pin above unless
+# you reinstall websockets==12.0 afterward - FastAPI/uvicorn's own /ws/live endpoint needs the
+# newer version. Always run `pip install websockets==12.0` again right after installing neo_api_client.
+neo_api_client @ git+https://github.com/Kotak-Neo/Kotak-neo-api-v2.git@v2.0.2#egg=neo_api_client

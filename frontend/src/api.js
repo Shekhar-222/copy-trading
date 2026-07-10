@@ -24,6 +24,8 @@ export const api = {
   manualToken: (id, request_token) =>
     request(`/accounts/${id}/manual-token`, { method: 'POST', body: JSON.stringify({ request_token }) }),
   refreshCapital: (id) => request(`/accounts/${id}/refresh-capital`, { method: 'POST' }),
+  exitPositions: (id) => request(`/accounts/${id}/exit`, { method: 'POST' }),
+  getPositions: (id) => request(`/accounts/${id}/positions`),
   getLogs: () => request('/logs'),
   getStatus: () => request('/status'),
   getPnl: () => request('/pnl'),

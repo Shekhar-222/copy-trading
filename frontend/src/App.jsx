@@ -7,6 +7,7 @@ import TradeFeed from './components/TradeFeed'
 import AddAccountModal from './components/AddAccountModal'
 import TokenModal from './components/TokenModal'
 import ConfirmModal from './components/ConfirmModal'
+import PositionsModal from './components/PositionsModal'
 
 export default function App() {
   const [accounts, setAccounts] = useState([])
@@ -16,6 +17,9 @@ export default function App() {
   const [showAdd, setShowAdd] = useState(false)
   const [tokenModalAccount, setTokenModalAccount] = useState(null)
   const [deleteTarget, setDeleteTarget] = useState(null)
+  const [exitTarget, setExitTarget] = useState(null)
+  const [exiting, setExiting] = useState(false)
+  const [positionsTarget, setPositionsTarget] = useState(null)
   const [now, setNow] = useState(new Date())
   const wsRef = useRef(null)
 
@@ -68,6 +72,17 @@ export default function App() {
     catch (e) { alert(e.message) }
   }
   const handleSetMultiplier = async (id, val) => { await api.setMultiplier(id, val); await load() }
+  const handleExit = async (id) => {
+    setExiting(true)
+    try {
+      await api.exitPositions(id)
+      await load()
+    } catch (e) {
+      alert(e.message)
+    } finally {
+      setExiting(false)
+    }
+  }
 
   return (
     <div className="app">
@@ -97,6 +112,8 @@ export default function App() {
             onLogin={handleAutoLogin}
             onManualLogin={setTokenModalAccount}
             onDelete={setDeleteTarget}
+            onExit={setExitTarget}
+            onShowPositions={setPositionsTarget}
           />
         ))}
 
@@ -119,6 +136,8 @@ export default function App() {
                 onManualLogin={setTokenModalAccount}
                 onDelete={setDeleteTarget}
                 onSetMultiplier={handleSetMultiplier}
+                onExit={setExitTarget}
+                onShowPositions={setPositionsTarget}
               />
             ))}
           </div>
@@ -144,6 +163,18 @@ export default function App() {
           onConfirm={() => handleDelete(deleteTarget.id)}
           onClose={() => setDeleteTarget(null)}
         />
+      )}
+      {exitTarget && (
+        <ConfirmModal
+          title={`Exit all positions on ${exitTarget.label}?`}
+          message={`This immediately cancels every pending order and squares off every open position on "${exitTarget.label}" (${exitTarget.client_id}) at the current market price. This cannot be undone.`}
+          confirmLabel={exiting ? 'Exiting…' : 'Exit all'}
+          onConfirm={() => handleExit(exitTarget.id)}
+          onClose={() => setExitTarget(null)}
+        />
+      )}
+      {positionsTarget && (
+        <PositionsModal account={positionsTarget} onClose={() => setPositionsTarget(null)} />
       )}
     </div>
   )

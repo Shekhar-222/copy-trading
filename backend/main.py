@@ -14,7 +14,10 @@ import models
 import crypto_utils
 from database import engine, get_db, Base
 from kite_auth import auto_generate_request_token, generate_access_token, get_kite_client, LoginError
+from kotak_auth import get_kotak_client, KotakLoginError
+import kotak_client
 from ticker_listener import start_master_listener, stop_master_listener, is_running
+from replication_engine import exit_account
 
 load_dotenv()
 Base.metadata.create_all(bind=engine)
@@ -30,6 +33,16 @@ def _run_light_migrations():
     if "real_name" not in existing_cols:
         with engine.begin() as conn:
             conn.exec_driver_sql("ALTER TABLE accounts ADD COLUMN real_name VARCHAR")
+    if "broker" not in existing_cols:
+        with engine.begin() as conn:
+            conn.exec_driver_sql("ALTER TABLE accounts ADD COLUMN broker VARCHAR DEFAULT 'zerodha'")
+            conn.exec_driver_sql("UPDATE accounts SET broker = 'zerodha' WHERE broker IS NULL")
+    if "mpin_enc" not in existing_cols:
+        with engine.begin() as conn:
+            conn.exec_driver_sql("ALTER TABLE accounts ADD COLUMN mpin_enc TEXT")
+    if "mobile_number" not in existing_cols:
+        with engine.begin() as conn:
+            conn.exec_driver_sql("ALTER TABLE accounts ADD COLUMN mobile_number VARCHAR")
 
 
 _run_light_migrations()
@@ -89,11 +102,14 @@ async def live_updates(ws: WebSocket):
 class AccountCreate(BaseModel):
     label: str
     role: str  # "master" or "child"
-    client_id: str
-    api_key: str
-    api_secret: str
-    password: Optional[str] = None
+    broker: str = "zerodha"  # "zerodha" or "kotak_neo"
+    client_id: str  # Kite client id, or Kotak Neo UCC
+    api_key: str  # Kite api_key, or Kotak Neo consumer_key
+    api_secret: Optional[str] = None  # Kite api_secret (required for zerodha, unused for kotak_neo)
+    password: Optional[str] = None  # Zerodha login password - only used for zerodha auto-login
     totp_secret: str
+    mpin: Optional[str] = None  # Kotak Neo MPIN - required for kotak_neo
+    mobile_number: Optional[str] = None  # Kotak Neo registered mobile number - required for kotak_neo
     multiplier_override: Optional[float] = None
 
 
@@ -101,6 +117,7 @@ class AccountOut(BaseModel):
     id: int
     label: str
     role: str
+    broker: str
     client_id: str
     real_name: Optional[str] = None
     capital: float
@@ -133,6 +150,7 @@ def _to_out(acc: models.Account) -> dict:
         "id": acc.id,
         "label": acc.label,
         "role": acc.role,
+        "broker": acc.broker,
         "client_id": acc.client_id,
         "real_name": acc.real_name,
         "capital": acc.capital,
@@ -148,14 +166,28 @@ def _to_out(acc: models.Account) -> dict:
 def create_account(payload: AccountCreate, db: Session = Depends(get_db)):
     if payload.role not in ("master", "child"):
         raise HTTPException(400, "role must be 'master' or 'child'")
+    if payload.broker not in ("zerodha", "kotak_neo"):
+        raise HTTPException(400, "broker must be 'zerodha' or 'kotak_neo'")
+    if payload.broker == "kotak_neo":
+        if payload.role != "child":
+            raise HTTPException(400, "Kotak Neo accounts can only be added as child accounts for now.")
+        if not payload.mpin or not payload.mobile_number:
+            raise HTTPException(400, "mpin and mobile_number are required for Kotak Neo accounts.")
+    else:
+        if not payload.api_secret:
+            raise HTTPException(400, "api_secret is required for Zerodha accounts.")
+
     acc = models.Account(
         label=payload.label,
         role=payload.role,
+        broker=payload.broker,
         client_id=payload.client_id,
         api_key_enc=crypto_utils.encrypt(payload.api_key),
-        api_secret_enc=crypto_utils.encrypt(payload.api_secret),
+        api_secret_enc=crypto_utils.encrypt(payload.api_secret or ""),
         password_enc=crypto_utils.encrypt(payload.password) if payload.password else None,
         totp_secret_enc=crypto_utils.encrypt(payload.totp_secret),
+        mpin_enc=crypto_utils.encrypt(payload.mpin) if payload.mpin else None,
+        mobile_number=payload.mobile_number,
         multiplier_override=payload.multiplier_override,
     )
     db.add(acc)
@@ -209,10 +241,32 @@ def toggle_active(account_id: int, db: Session = Depends(get_db)):
 # ---------------------------- Daily login / token ----------------------------
 @app.post("/accounts/{account_id}/auto-login")
 def auto_login(account_id: int, db: Session = Depends(get_db)):
-    """Attempts fully automated login using stored password + TOTP secret."""
+    """Zerodha: attempts fully automated login using stored password + TOTP secret. Kotak
+    Neo: logs in fresh with TOTP + MPIN (no password needed, no SMS OTP involved) - see
+    kotak_auth.py. Both paths finish by refreshing capital and, for a Zerodha master, starting
+    the order-update listener."""
     acc = db.query(models.Account).get(account_id)
     if not acc:
         raise HTTPException(404, "not found")
+
+    if acc.broker == "kotak_neo":
+        try:
+            get_kotak_client(
+                consumer_key=crypto_utils.decrypt(acc.api_key_enc),
+                mobile_number=acc.mobile_number,
+                ucc=acc.client_id,
+                totp_secret=crypto_utils.decrypt(acc.totp_secret_enc),
+                mpin=crypto_utils.decrypt(acc.mpin_enc),
+            )
+        except KotakLoginError as e:
+            raise HTTPException(400, f"Kotak Neo login failed: {e}")
+
+        acc.access_token_enc = crypto_utils.encrypt("kotak-neo-verified")
+        acc.token_generated_at = datetime.datetime.utcnow()
+        db.commit()
+        _refresh_capital(acc, db)
+        return _to_out(acc)
+
     if not acc.password_enc:
         raise HTTPException(400, "No password stored for this account - use manual token login instead.")
 
@@ -246,10 +300,13 @@ def auto_login(account_id: int, db: Session = Depends(get_db)):
 @app.get("/accounts/{account_id}/login-url")
 def get_login_url(account_id: int, db: Session = Depends(get_db)):
     """Returns the URL you should open in a browser, log in manually, then copy the
-    request_token from the redirected URL and POST it to /accounts/{id}/manual-token."""
+    request_token from the redirected URL and POST it to /accounts/{id}/manual-token.
+    Zerodha only - Kotak Neo's TOTP+MPIN login has no manual/browser step, use auto-login."""
     acc = db.query(models.Account).get(account_id)
     if not acc:
         raise HTTPException(404, "not found")
+    if acc.broker == "kotak_neo":
+        raise HTTPException(400, "Kotak Neo doesn't use a manual-token login flow - use auto-login instead.")
     api_key = crypto_utils.decrypt(acc.api_key_enc)
     return {"login_url": f"https://kite.zerodha.com/connect/login?api_key={api_key}&v=3"}
 
@@ -259,6 +316,8 @@ def manual_token(account_id: int, payload: ManualTokenIn, db: Session = Depends(
     acc = db.query(models.Account).get(account_id)
     if not acc:
         raise HTTPException(404, "not found")
+    if acc.broker == "kotak_neo":
+        raise HTTPException(400, "Kotak Neo doesn't use a manual-token login flow - use auto-login instead.")
     try:
         access_token = generate_access_token(
             api_key=crypto_utils.decrypt(acc.api_key_enc),
@@ -292,15 +351,75 @@ def refresh_capital(account_id: int, db: Session = Depends(get_db)):
 
 
 def _refresh_capital(acc: models.Account, db: Session):
+    if acc.broker == "kotak_neo":
+        acc.capital = kotak_client.get_margin(acc)
+        try:
+            acc.real_name = kotak_client.get_profile_name(acc)
+        except Exception:
+            pass
+        db.commit()
+        return
+
     kite = get_kite_client(crypto_utils.decrypt(acc.api_key_enc), crypto_utils.decrypt(acc.access_token_enc))
     margins = kite.margins()
-    acc.capital = margins.get("equity", {}).get("available", {}).get("live_balance", 0.0)
+    # "net" (cash + collateral - utilised) reflects true usable capital, including pledged-stock
+    # collateral. "live_balance" only counts cash and ignores collateral entirely - for a
+    # collateral-funded account it can show a small or negative number even when the account has
+    # lakhs of real usable margin, which makes it a poor basis for proportional position sizing.
+    acc.capital = margins.get("equity", {}).get("net", 0.0)
     try:
         profile = kite.profile()
         acc.real_name = profile.get("user_name") or profile.get("user_shortname")
     except Exception:
         pass
     db.commit()
+
+
+@app.post("/accounts/{account_id}/exit")
+def exit_positions(account_id: int, db: Session = Depends(get_db)):
+    """Cancels every pending order and squares off every open position on this one account.
+    For Kotak Neo accounts, only pending-order cancellation is automated for now - see
+    kotak_client.exit_account."""
+    acc = db.query(models.Account).get(account_id)
+    if not acc:
+        raise HTTPException(404, "not found")
+    if not _token_is_fresh(acc):
+        raise HTTPException(400, "No valid token for today - log in first.")
+    results = exit_account(db, acc, broadcast=broadcast)
+    return {"results": results}
+
+
+@app.get("/accounts/{account_id}/positions")
+def get_positions(account_id: int, db: Session = Depends(get_db)):
+    """Both open and closed (squared-off today) positions for one account, fetched fresh on
+    demand - not polled automatically, since the dashboard only needs this when a card's
+    positions panel is expanded. "status" is "OPEN" for a non-zero net quantity, "CLOSED" for
+    a position that was fully squared off today (net quantity 0, but still carries realized
+    P&L worth showing)."""
+    acc = db.query(models.Account).get(account_id)
+    if not acc:
+        raise HTTPException(404, "not found")
+    if not _token_is_fresh(acc):
+        return []
+    try:
+        if acc.broker == "kotak_neo":
+            return kotak_client.get_positions(acc)
+        kite = get_kite_client(crypto_utils.decrypt(acc.api_key_enc), crypto_utils.decrypt(acc.access_token_enc))
+        positions = kite.positions().get("net", [])
+        return [
+            {
+                "tradingsymbol": p.get("tradingsymbol"),
+                "exchange": p.get("exchange"),
+                "quantity": p.get("quantity"),
+                "average_price": p.get("average_price"),
+                "pnl": p.get("pnl"),
+                "product": p.get("product"),
+                "status": "OPEN" if p.get("quantity", 0) != 0 else "CLOSED",
+            }
+            for p in positions
+        ]
+    except Exception:
+        return []
 
 
 # ---------------------------- Trade logs ----------------------------
@@ -334,7 +453,9 @@ def get_logs(limit: int = 100, db: Session = Depends(get_db)):
 
 @app.get("/pnl")
 def get_pnl(db: Session = Depends(get_db)):
-    """Live running P&L per account, pulled from Kite's open positions."""
+    """Live running P&L per account, pulled from open positions. Kotak Neo's figure is
+    best-effort (see kotak_client.get_pnl) since its positions API doesn't return a ready-made
+    PnL the way Kite's does."""
     accounts = db.query(models.Account).all()
     out = []
     total = 0.0
@@ -342,9 +463,12 @@ def get_pnl(db: Session = Depends(get_db)):
         pnl = None
         if _token_is_fresh(acc):
             try:
-                kite = get_kite_client(crypto_utils.decrypt(acc.api_key_enc), crypto_utils.decrypt(acc.access_token_enc))
-                positions = kite.positions()
-                pnl = sum(p.get("pnl", 0.0) for p in positions.get("net", []))
+                if acc.broker == "kotak_neo":
+                    pnl = kotak_client.get_pnl(acc)
+                else:
+                    kite = get_kite_client(crypto_utils.decrypt(acc.api_key_enc), crypto_utils.decrypt(acc.access_token_enc))
+                    positions = kite.positions()
+                    pnl = sum(p.get("pnl", 0.0) for p in positions.get("net", []))
             except Exception:
                 pnl = None
         out.append({"id": acc.id, "role": acc.role, "pnl": pnl})

@@ -1,7 +1,7 @@
 import { useState } from 'react'
 import PnlBadge from './PnlBadge'
 
-export default function ChildCard({ account, masterCapital, pnl, onToggle, onLogin, onManualLogin, onDelete, onSetMultiplier }) {
+export default function ChildCard({ account, masterCapital, pnl, onToggle, onLogin, onManualLogin, onDelete, onSetMultiplier, onExit, onShowPositions }) {
   const ratio = masterCapital > 0 ? Math.min((account.capital / masterCapital) * 100, 100) : 0
   const effectiveMultiplier = account.multiplier_override ?? (masterCapital > 0 ? account.capital / masterCapital : 0)
   const [editing, setEditing] = useState(false)
@@ -32,7 +32,9 @@ export default function ChildCard({ account, masterCapital, pnl, onToggle, onLog
           {account.has_token_today ? 'READY' : 'NO TOKEN'}
         </span>
       </div>
-      <div className="id" style={{ marginTop: -6 }}>{account.client_id} · child</div>
+      <div className="id" style={{ marginTop: -6 }}>
+        {account.client_id} · child · {account.broker === 'kotak_neo' ? 'Kotak Neo' : 'Zerodha'}
+      </div>
       {account.real_name && (
         <div className="real-name" title="Fetched from the Zerodha profile">
           <span className="verified-glyph">✓</span> {account.real_name}
@@ -45,6 +47,10 @@ export default function ChildCard({ account, masterCapital, pnl, onToggle, onLog
       <div className="capital-row">
         <span>Capital</span>
         <b>₹{account.capital?.toLocaleString('en-IN') ?? '—'}</b>
+      </div>
+      <div className="capital-row" title="This account's capital as a fraction of the master's - the exact multiplier value used for proportional sizing">
+        <span>Child / Master</span>
+        <b>{masterCapital > 0 && account.capital > 0 ? `${(account.capital / masterCapital).toFixed(3)}×` : '—'}</b>
       </div>
       <PnlBadge label="Running P&L" value={pnl} />
       <div className="multiplier-row">
@@ -81,7 +87,9 @@ export default function ChildCard({ account, masterCapital, pnl, onToggle, onLog
         {!account.has_token_today && (
           <>
             <button className="btn small" onClick={() => onLogin(account.id)}>Auto-login</button>
-            <button className="btn small" onClick={() => onManualLogin(account)}>Manual token</button>
+            {account.broker !== 'kotak_neo' && (
+              <button className="btn small" onClick={() => onManualLogin(account)}>Manual token</button>
+            )}
           </>
         )}
         <button
@@ -89,6 +97,12 @@ export default function ChildCard({ account, masterCapital, pnl, onToggle, onLog
           onClick={() => onToggle(account.id)}
         >
           {account.active ? 'Exclude' : 'Include'}
+        </button>
+        <button className="btn small" disabled={!account.has_token_today} onClick={() => onShowPositions(account)}>
+          Positions
+        </button>
+        <button className="btn small danger" disabled={!account.has_token_today} onClick={() => onExit(account)}>
+          Exit all
         </button>
         <button className="btn small danger" onClick={() => onDelete(account)}>Remove</button>
       </div>
