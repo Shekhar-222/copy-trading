@@ -1,0 +1,9 @@
+backend/venv/
+backend/.env
+backend/*.db
+backend/*.log
+node_modules/
+frontend/dist/
+__pycache__/
+*.pyc
+.claude/settings.local.json
