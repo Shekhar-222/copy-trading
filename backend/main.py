@@ -437,7 +437,9 @@ def get_logs(limit: int = 100, db: Session = Depends(get_db)):
         out.append(
             {
                 "id": log.id,
-                "timestamp": log.timestamp,
+                # naive UTC (see trade_log.to_dict) - append "Z" so the frontend parses it as
+                # UTC instead of misreading it as already being local time.
+                "timestamp": log.timestamp.isoformat() + "Z",
                 "child_account": child.label if child else None,
                 "tradingsymbol": log.tradingsymbol,
                 "exchange": log.exchange,

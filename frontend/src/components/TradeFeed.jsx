@@ -20,7 +20,7 @@ export default function TradeFeed({ logs }) {
       <tbody>
         {logs.map((log, i) => (
           <tr key={i}>
-            <td>{new Date(log.timestamp).toLocaleTimeString('en-IN')}</td>
+            <td>{new Date(log.timestamp).toLocaleTimeString('en-IN', { timeZone: 'Asia/Kolkata' })}</td>
             <td>{log.child_account}</td>
             <td>{log.tradingsymbol}</td>
             <td><span className={`tag ${log.transaction_type === 'BUY' ? 'buy' : 'sell'}`}>{log.transaction_type}</span></td>

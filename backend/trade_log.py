@@ -36,8 +36,11 @@ def log_trade_event(db: Session, account: models.Account, exchange, tradingsymbo
 
 
 def to_dict(log: "models.TradeLog", account_label: str) -> dict:
+    # log.timestamp is always naive UTC (set via datetime.utcnow()) - append "Z" explicitly so
+    # the frontend's `new Date(...)` parses it as UTC and converts to the viewer's local time
+    # correctly, instead of misreading an offset-less ISO string as already being local time.
     return {
-        "timestamp": log.timestamp.isoformat(),
+        "timestamp": log.timestamp.isoformat() + "Z",
         "child_account": account_label,
         "tradingsymbol": log.tradingsymbol,
         "exchange": log.exchange,
