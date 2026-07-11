@@ -8,6 +8,7 @@ import AddAccountModal from './components/AddAccountModal'
 import TokenModal from './components/TokenModal'
 import ConfirmModal from './components/ConfirmModal'
 import PositionsModal from './components/PositionsModal'
+import TickerTape from './components/TickerTape'
 
 export default function App() {
   const [accounts, setAccounts] = useState([])
@@ -87,7 +88,7 @@ export default function App() {
   return (
     <div className="app">
       <div className="topbar">
-        <h1><span className="dot" /> Copy Trader</h1>
+        <h1><span className="dot" /> Copy Trading </h1>
         <div className="row" style={{ gap: 16 }}>
           <span className="sub">
             {now.toLocaleDateString('en-IN', { weekday: 'short', day: '2-digit', month: 'short' })}
@@ -98,6 +99,8 @@ export default function App() {
           <PnlBadge label="Aggregate P&L" value={pnl.total} layout="pill" size="lg" />
         </div>
       </div>
+
+      <TickerTape />
 
       <div className="main">
         <div className="section-title">Master account</div>

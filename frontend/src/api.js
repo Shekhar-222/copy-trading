@@ -1,10 +1,34 @@
 const BASE = import.meta.env.VITE_API_BASE || 'http://localhost:8000'
+const TOKEN_KEY = 'copytrader_access_token'
+
+export const accessToken = {
+  get: () => localStorage.getItem(TOKEN_KEY) || '',
+  set: (token) => localStorage.setItem(TOKEN_KEY, token),
+  clear: () => localStorage.removeItem(TOKEN_KEY),
+}
+
+// Used by AccessGate to check a candidate token before storing it - a plain fetch (not
+// `request()` above) since a wrong/missing token should just report false, not clear
+// storage or force a reload.
+export async function verifyAccessToken(token) {
+  try {
+    const res = await fetch(`${BASE}/status`, { headers: { 'X-Access-Token': token } })
+    return res.ok
+  } catch {
+    return false
+  }
+}
 
 async function request(path, options = {}) {
   const res = await fetch(`${BASE}${path}`, {
-    headers: { 'Content-Type': 'application/json' },
+    headers: { 'Content-Type': 'application/json', 'X-Access-Token': accessToken.get() },
     ...options,
   })
+  if (res.status === 401) {
+    accessToken.clear()
+    window.location.reload() // drop back to the unlock screen
+    throw new Error('Unauthorized')
+  }
   if (!res.ok) {
     const body = await res.json().catch(() => ({}))
     throw new Error(body.detail || `Request failed: ${res.status}`)
@@ -27,7 +51,12 @@ export const api = {
   exitPositions: (id) => request(`/accounts/${id}/exit`, { method: 'POST' }),
   getPositions: (id) => request(`/accounts/${id}/positions`),
   getLogs: () => request('/logs'),
+  getTicker: () => request('/ticker'),
   getStatus: () => request('/status'),
   getPnl: () => request('/pnl'),
-  wsUrl: () => BASE.replace('http', 'ws') + '/ws/live',
+  wsUrl: () => {
+    const token = accessToken.get()
+    const url = BASE.replace('http', 'ws') + '/ws/live'
+    return token ? `${url}?token=${encodeURIComponent(token)}` : url
+  },
 }

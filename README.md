@@ -88,10 +88,11 @@ Product type mirrors the master order (defaults to MIS if unspecified) for both 
 ## Security notes — please read
 
 - API secrets, TOTP secrets, and (if provided) your login password are encrypted at rest using the
-  `ENCRYPTION_KEY` in `.env`, but this app has no user-login layer of its own — anyone with access
-  to the machine or the dashboard URL can trade on all connected accounts. Only run this on a
-  machine you control, and don't expose port 8000/5173 to the open internet without adding your
-  own auth layer.
+  `ENCRYPTION_KEY` in `.env`, but this app has no per-user accounts of its own — anyone who reaches
+  the dashboard URL can trade on all connected accounts. For local-only use this is fine (only you
+  can reach `localhost`). If you deploy it somewhere reachable off your machine, **set
+  `APP_ACCESS_TOKEN`** (see §8) first — without it, the API and WebSocket are wide open to anyone
+  with the URL.
 - The automated login (`kite_auth.py`) drives Zerodha's *web login pages*, not an official Kite
   Connect endpoint — it's the same technique many open-source Kite tools use, but Zerodha can
   change their login flow without notice, which would break auto-login until updated. The manual
@@ -137,21 +138,86 @@ account from here — a few things to verify on first real use, and report back 
 - Test everything in small size / paper first. This places real orders with real money the
   moment the master's order completes.
 
+## 8. Deploying so you can access it from any machine
+
+The backend is a long-running process — it holds a persistent WebSocket to the market during
+trading hours and keeps a SQLite file that must survive restarts — so it needs an always-on host
+with a persistent disk, not a serverless/sleep-on-idle free tier. This section deploys the
+**backend on Railway** and the **frontend (static) on Vercel**.
+
+### 8.1 Push to GitHub
+
+```bash
+git add -A
+git commit -m "Deploy: add access gate, Dockerfile, Railway/Vercel config"
+git push
+```
+
+### 8.2 Backend → Railway
+
+1. On [railway.app](https://railway.app), **New Project → Deploy from GitHub repo**, pick this repo.
+2. In the service's **Settings → Source**, set **Root Directory** to `backend`. Railway will detect
+   `backend/Dockerfile` and `backend/railway.toml` automatically.
+3. **Settings → Volumes → New Volume**, mount it at `/data`. This is what makes your account data
+   survive redeploys.
+4. **Variables**, add:
+   - `ENCRYPTION_KEY` — generate with
+     `python -c "from cryptography.fernet import Fernet; print(Fernet.generate_key().decode())"`
+   - `DATABASE_URL` = `sqlite:////data/copytrader.db` (note **4 slashes** — that's the volume path)
+   - `APP_ACCESS_TOKEN` — generate with `python -c "import secrets; print(secrets.token_urlsafe(24))"`.
+     This is the password the dashboard will ask for once deployed — see the security note below.
+   - `FRONTEND_ORIGIN` — leave as `http://localhost:5173` for now, you'll update it after step 8.3
+     once you have your Vercel URL.
+5. **Settings → Networking → Generate Domain** to get a public URL
+   (e.g. `https://copy-trading-production.up.railway.app`). Every `git push` redeploys automatically.
+
+### 8.3 Frontend → Vercel
+
+1. On [vercel.com](https://vercel.com), **Add New → Project**, import the same GitHub repo.
+2. Set **Root Directory** to `frontend` (Vercel auto-detects the Vite build command/output).
+3. **Environment Variables**, add `VITE_API_BASE` = your Railway URL from step 8.2 (no trailing slash).
+4. Deploy. You'll get a URL like `https://your-app.vercel.app`.
+5. Back on Railway, update `FRONTEND_ORIGIN` to that Vercel URL (comma-separate if you still want
+   local dev to work too: `http://localhost:5173,https://your-app.vercel.app`) — Railway redeploys
+   automatically on a variable change.
+
+Open the Vercel URL from any machine — you'll be asked for the access code (`APP_ACCESS_TOKEN`)
+once per browser before the dashboard loads.
+
+### Security note on deploying this publicly
+
+This app places real orders and squares off real positions with **no per-user accounts** — it's
+built for a single operator. `APP_ACCESS_TOKEN` (§8.2) is a single shared-secret gate on the whole
+API and dashboard, checked on every request and on the WebSocket handshake; treat it like a
+password (a long random string, not shared, rotate it if you suspect it leaked — just change the
+Railway variable). It is **not** a substitute for keeping the URL itself private: don't post it
+publicly, and consider Railway's own network restriction options if you want to lock the backend
+down to specific IPs.
+
+The SQLite file lives on the Railway volume, which is durable but is still a single copy — the
+app's own nightly-on-startup backup (`database.py:backup_sqlite_db`) writes timestamped copies
+into the same volume, which protects against a bad migration but not against losing the volume
+itself. If you want off-host durability, periodically download the DB file via Railway's shell/CLI,
+or migrate `DATABASE_URL` to a managed Postgres instance (Railway offers one — SQLAlchemy already
+reads the URL from this env var, so the code needs no change beyond that and installing
+`psycopg2-binary`).
+
 ## Project structure
 
 ```
 backend/
-  main.py                # FastAPI app: REST routes + live WebSocket broadcast
-  models.py               # Account + TradeLog tables (SQLAlchemy)
-  database.py              # SQLite engine/session
+  main.py                # FastAPI app: REST routes + live WebSocket broadcast + access gate
+  models.py               # Account + TradeLog + MirroredOrder tables (SQLAlchemy)
+  database.py              # SQLite engine/session + on-startup backup
   crypto_utils.py           # Fernet encryption for stored secrets
   trade_log.py               # Shared TradeLog creation/broadcast helper (both brokers)
   kite_auth.py                 # Zerodha daily access-token generation (auto + manual)
   kotak_auth.py                  # Kotak Neo TOTP+MPIN login
   kotak_client.py                  # Kotak Neo order placement, symbol mapping, capital, exit
-  replication_engine.py              # Proportional sizing + order placement, dispatches by broker
+  replication_engine.py              # Proportional sizing, freeze-limit slicing, order placement
   ticker_listener.py                   # KiteTicker order-update listener (master, Zerodha only)
+  Dockerfile, railway.toml               # Backend deploy config (see §8)
 frontend/
   src/App.jsx              # Dashboard shell, live feed via WebSocket
-  src/components/           # MasterCard, ChildCard, TradeFeed, modals
+  src/components/           # MasterCard, ChildCard, TradeFeed, TickerTape, AccessGate, modals
 ```

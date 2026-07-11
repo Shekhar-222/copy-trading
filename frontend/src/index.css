@@ -67,6 +67,127 @@ body {
   font-variant-numeric: tabular-nums;
 }
 
+/* ---- Scrolling index ticker tape (below the topbar) ---- */
+.ticker-tape {
+  overflow: hidden;
+  background: var(--bg-panel);
+  border-bottom: 1px solid var(--border);
+  user-select: none;
+}
+
+.ticker-track {
+  display: inline-flex;
+  white-space: nowrap;
+  will-change: transform;
+  animation: ticker-scroll 40s linear infinite;
+}
+
+.ticker-tape:hover .ticker-track {
+  animation-play-state: paused;
+}
+
+.ticker-half {
+  display: inline-flex;
+}
+
+@keyframes ticker-scroll {
+  from { transform: translateX(0); }
+  to { transform: translateX(-50%); }
+}
+
+.ticker-item {
+  display: inline-flex;
+  align-items: baseline;
+  gap: 8px;
+  padding: 7px 28px;
+  font-family: var(--font-mono);
+  font-size: 12.5px;
+  border-right: 1px solid var(--border);
+}
+
+.ticker-symbol {
+  color: var(--text-muted);
+  font-weight: 700;
+  letter-spacing: 0.05em;
+}
+
+.ticker-price {
+  color: var(--text-primary);
+  font-variant-numeric: tabular-nums;
+}
+
+.ticker-up {
+  color: var(--teal);
+  font-variant-numeric: tabular-nums;
+}
+
+.ticker-down {
+  color: var(--coral);
+  font-variant-numeric: tabular-nums;
+}
+
+/* ---- Access gate (shared-secret unlock screen shown before the dashboard loads) ---- */
+.access-gate {
+  min-height: 100vh;
+  display: flex;
+  align-items: center;
+  justify-content: center;
+  padding: 24px;
+}
+
+.access-gate-card {
+  width: 100%;
+  max-width: 340px;
+  display: flex;
+  flex-direction: column;
+  gap: 14px;
+  background: var(--bg-panel);
+  border: 1px solid var(--border);
+  border-radius: 12px;
+  padding: 28px 26px;
+}
+
+.access-gate-card h1 {
+  font-size: 18px;
+  font-weight: 800;
+  margin: 0;
+  display: flex;
+  align-items: center;
+  gap: 10px;
+}
+
+.access-gate-card h1 .dot {
+  width: 8px; height: 8px; border-radius: 50%;
+  background: var(--teal);
+  box-shadow: 0 0 8px var(--teal);
+}
+
+.access-gate-card p {
+  margin: 0;
+  color: var(--text-muted);
+  font-size: 13px;
+}
+
+.access-gate-card input {
+  background: var(--bg);
+  border: 1px solid var(--border);
+  border-radius: 8px;
+  padding: 10px 12px;
+  color: var(--text-primary);
+  font-family: var(--font-mono);
+  font-size: 14px;
+}
+
+.access-gate-card input:focus {
+  outline: none;
+  border-color: var(--teal);
+}
+
+.access-gate-error {
+  color: var(--coral);
+  font-size: 13px;
+}
+
 .main {
   flex: 1;
   padding: 28px 32px 60px;

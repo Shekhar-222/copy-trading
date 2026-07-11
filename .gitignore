@@ -2,6 +2,7 @@ backend/venv/
 backend/.env
 backend/*.db
 backend/*.log
+backend/backups/
 node_modules/
 frontend/dist/
 __pycache__/

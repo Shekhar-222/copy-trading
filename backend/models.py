@@ -43,6 +43,32 @@ class Account(Base):
     created_at = Column(DateTime, default=datetime.datetime.utcnow)
 
 
+class MirroredOrder(Base):
+    """Tracks a LIMIT/SL/SL-M order mirrored onto a child's own book while it's still resting
+    on the master's (see replication_engine._handle_order_lifecycle) - so a later order-update
+    event for the same master order (modify/cancel/trigger) can find and act on the matching
+    child order instead of re-mirroring it or losing track of it. One master order can map to
+    SEVERAL rows per child: quantities above the exchange's freeze limit are sliced into
+    multiple child orders, each tracked as its own row."""
+    __tablename__ = "mirrored_orders"
+
+    id = Column(Integer, primary_key=True, index=True)
+    master_order_id = Column(String, nullable=False, index=True)
+    child_account_id = Column(Integer, ForeignKey("accounts.id"), nullable=False)
+    child_order_id = Column(String, nullable=False)
+    exchange = Column(String)
+    tradingsymbol = Column(String)
+    transaction_type = Column(String)
+    order_type = Column(String)                          # "LIMIT", "SL", or "SL-M"
+    variety = Column(String, default="regular")          # "regular" or "amo" - must match on modify/cancel
+    trigger_price = Column(Float)
+    price = Column(Float, nullable=True)
+    quantity = Column(Integer)
+    status = Column(String, default="OPEN")              # OPEN / CANCELLED / COMPLETE
+    created_at = Column(DateTime, default=datetime.datetime.utcnow)
+    updated_at = Column(DateTime, default=datetime.datetime.utcnow, onupdate=datetime.datetime.utcnow)
+
+
 class TradeLog(Base):
     __tablename__ = "trade_logs"
 

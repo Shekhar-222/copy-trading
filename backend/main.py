@@ -1,10 +1,12 @@
 import os
+import hmac
 import asyncio
 import datetime
 from typing import Optional, List
 
-from fastapi import FastAPI, Depends, HTTPException, WebSocket, WebSocketDisconnect
+from fastapi import FastAPI, Depends, HTTPException, Request, WebSocket, WebSocketDisconnect
 from fastapi.middleware.cors import CORSMiddleware
+from fastapi.responses import JSONResponse
 from pydantic import BaseModel
 from sqlalchemy import inspect
 from sqlalchemy.orm import Session
@@ -12,12 +14,13 @@ from dotenv import load_dotenv
 
 import models
 import crypto_utils
-from database import engine, get_db, Base
+from database import engine, get_db, Base, SessionLocal, backup_sqlite_db
 from kite_auth import auto_generate_request_token, generate_access_token, get_kite_client, LoginError
 from kotak_auth import get_kotak_client, KotakLoginError
 import kotak_client
 from ticker_listener import start_master_listener, stop_master_listener, is_running
 from replication_engine import exit_account
+import trade_log
 
 load_dotenv()
 Base.metadata.create_all(bind=engine)
@@ -44,18 +47,51 @@ def _run_light_migrations():
         with engine.begin() as conn:
             conn.exec_driver_sql("ALTER TABLE accounts ADD COLUMN mobile_number VARCHAR")
 
+    if "mirrored_orders" in inspector.get_table_names():
+        existing_mirror_cols = {c["name"] for c in inspector.get_columns("mirrored_orders")}
+        if "variety" not in existing_mirror_cols:
+            with engine.begin() as conn:
+                conn.exec_driver_sql("ALTER TABLE mirrored_orders ADD COLUMN variety VARCHAR DEFAULT 'regular'")
+                conn.exec_driver_sql("UPDATE mirrored_orders SET variety = 'regular' WHERE variety IS NULL")
+
 
 _run_light_migrations()
 
 app = FastAPI(title="Zerodha Copy Trading API")
 
+_allowed_origins = [
+    o.strip() for o in os.getenv("FRONTEND_ORIGIN", "http://localhost:5173").split(",") if o.strip()
+]
 app.add_middleware(
     CORSMiddleware,
-    allow_origins=[os.getenv("FRONTEND_ORIGIN", "http://localhost:5173")],
+    allow_origins=_allowed_origins,
     allow_credentials=True,
     allow_methods=["*"],
     allow_headers=["*"],
 )
+
+# ---- Access gate ----
+# This app moves real money (order placement, position square-off) and has no per-user
+# accounts - it's built for one operator. APP_ACCESS_TOKEN is a single shared secret that
+# gates every request once this is deployed somewhere reachable off localhost. Left unset,
+# the app behaves exactly as before (open, for local-only use) - it's on the operator to set
+# this before exposing the API publicly.
+APP_ACCESS_TOKEN = os.getenv("APP_ACCESS_TOKEN")
+_PUBLIC_PATHS = {"/", "/openapi.json", "/docs", "/redoc", "/docs/oauth2-redirect"}
+
+
+def _token_matches(candidate: Optional[str]) -> bool:
+    return bool(candidate) and hmac.compare_digest(candidate, APP_ACCESS_TOKEN)
+
+
+@app.middleware("http")
+async def require_access_token(request: Request, call_next):
+    if not APP_ACCESS_TOKEN or request.method == "OPTIONS" or request.url.path in _PUBLIC_PATHS:
+        return await call_next(request)
+    header = request.headers.get("x-access-token")
+    if not _token_matches(header):
+        return JSONResponse({"detail": "Unauthorized"}, status_code=401)
+    return await call_next(request)
 
 # ---- WebSocket broadcast hub (pushes live trade-log / status events to the dashboard) ----
 _ws_clients: List[WebSocket] = []
@@ -66,6 +102,26 @@ _loop: Optional[asyncio.AbstractEventLoop] = None
 async def on_startup():
     global _loop
     _loop = asyncio.get_event_loop()
+
+    try:
+        backup_sqlite_db()
+    except Exception:  # noqa: BLE001 - a failed backup must never block startup
+        pass
+
+    # Resume order-update listeners for masters that were already active before a restart -
+    # otherwise replication silently stops until someone manually toggles the account off/on.
+    db = SessionLocal()
+    try:
+        masters = (
+            db.query(models.Account)
+            .filter(models.Account.role == "master", models.Account.active == True)  # noqa: E712
+            .all()
+        )
+        for m in masters:
+            if _token_is_fresh(m):
+                start_master_listener(m.id, broadcast=broadcast)
+    finally:
+        db.close()
 
 
 def broadcast(payload: dict):
@@ -88,6 +144,11 @@ async def _broadcast_async(payload: dict):
 
 @app.websocket("/ws/live")
 async def live_updates(ws: WebSocket):
+    # Browsers can't set custom headers on a WebSocket handshake, so the token travels as a
+    # query param here instead of the X-Access-Token header the HTTP middleware checks.
+    if APP_ACCESS_TOKEN and not _token_matches(ws.query_params.get("token")):
+        await ws.close(code=4401)
+        return
     await ws.accept()
     _ws_clients.append(ws)
     try:
@@ -425,22 +486,27 @@ def get_positions(account_id: int, db: Session = Depends(get_db)):
 # ---------------------------- Trade logs ----------------------------
 @app.get("/logs")
 def get_logs(limit: int = 100, db: Session = Depends(get_db)):
+    """Scoped to today's (IST) trades only, so the dashboard's live feed naturally clears each
+    day - older rows aren't deleted, just left out of this view."""
     logs = (
         db.query(models.TradeLog)
+        .filter(models.TradeLog.timestamp >= trade_log.today_ist_start_utc())
         .order_by(models.TradeLog.timestamp.desc())
         .limit(limit)
         .all()
     )
+    # One query for all labels instead of one per log row (this endpoint is polled by the
+    # dashboard, so an N+1 here multiplies quickly).
+    labels = dict(db.query(models.Account.id, models.Account.label).all())
     out = []
     for log in logs:
-        child = db.query(models.Account).get(log.child_account_id) if log.child_account_id else None
         out.append(
             {
                 "id": log.id,
                 # naive UTC (see trade_log.to_dict) - append "Z" so the frontend parses it as
                 # UTC instead of misreading it as already being local time.
                 "timestamp": log.timestamp.isoformat() + "Z",
-                "child_account": child.label if child else None,
+                "child_account": labels.get(log.child_account_id),
                 "tradingsymbol": log.tradingsymbol,
                 "exchange": log.exchange,
                 "transaction_type": log.transaction_type,
@@ -477,6 +543,60 @@ def get_pnl(db: Session = Depends(get_db)):
         if pnl is not None:
             total += pnl
     return {"accounts": out, "total": total}
+
+
+# ---------------------------- Index ticker ----------------------------
+_TICKER_INSTRUMENTS = [
+    ("NIFTY 50", "NSE:NIFTY 50"),
+    ("BANKNIFTY", "NSE:NIFTY BANK"),
+    ("SENSEX", "BSE:SENSEX"),
+    ("INDIA VIX", "NSE:INDIA VIX"),
+]
+_TICKER_CACHE_TTL = datetime.timedelta(seconds=5)
+_ticker_cache = {"at": None, "data": None}
+
+
+@app.get("/ticker")
+def get_ticker(db: Session = Depends(get_db)):
+    """Live index prices for the dashboard's scrolling ticker tape, fetched through any
+    logged-in Zerodha account's quote API (master preferred) - no separate market-data
+    subscription needed. Cached briefly server-side since the frontend polls this and
+    Kite rate-limits quote calls. Returns {"indices": []} when no Zerodha account has a
+    fresh token yet (the frontend simply hides the tape)."""
+    now = datetime.datetime.utcnow()
+    if _ticker_cache["at"] and now - _ticker_cache["at"] < _TICKER_CACHE_TTL:
+        return _ticker_cache["data"]
+
+    acc = next(
+        (a for a in db.query(models.Account).order_by(models.Account.role.desc()).all()
+         if a.broker == "zerodha" and _token_is_fresh(a)),
+        None,
+    )
+    if not acc:
+        return {"indices": []}
+
+    try:
+        kite = get_kite_client(crypto_utils.decrypt(acc.api_key_enc), crypto_utils.decrypt(acc.access_token_enc))
+        quotes = kite.ohlc([key for _, key in _TICKER_INSTRUMENTS])
+        indices = []
+        for name, key in _TICKER_INSTRUMENTS:
+            q = quotes.get(key)
+            if not q:
+                continue
+            last = q.get("last_price") or 0.0
+            prev_close = (q.get("ohlc") or {}).get("close") or 0.0
+            change = last - prev_close
+            indices.append({
+                "symbol": name,
+                "last_price": round(last, 2),
+                "change": round(change, 2),
+                "change_pct": round((change / prev_close) * 100, 2) if prev_close else 0.0,
+            })
+        data = {"indices": indices}
+        _ticker_cache["at"], _ticker_cache["data"] = now, data
+        return data
+    except Exception:  # noqa: BLE001 - a quote hiccup must never break the dashboard
+        return _ticker_cache["data"] or {"indices": []}
 
 
 @app.get("/status")

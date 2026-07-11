@@ -38,18 +38,91 @@ def compute_child_quantity(master_qty: int, master_capital: float, child_capital
     return max(lots, 0) * lot_size
 
 
+_FREEZE_QUANTITY = {
+    # NSE/BSE "freeze quantity" - the exchange rejects any single F&O order placed above this,
+    # per contract. Index values below are the latest published NSE/BSE circular figures; like
+    # lot sizes (see _guess_lot_size) these are revised periodically, so treat this as a
+    # best-effort table rather than a source of truth.
+    "NIFTY": 1800,
+    "BANKNIFTY": 900,
+    "FINNIFTY": 1800,
+    "MIDCPNIFTY": 3400,
+    "SENSEX": 1000,
+    "BANKEX": 900,
+}
+# Conservative fallback for any F&O/commodity/currency contract not listed above (mostly
+# individual stock derivatives, whose freeze quantity NSE sets per-stock and revises quarterly) -
+# errs toward slicing more than strictly necessary rather than risking an exchange rejection.
+_DEFAULT_FREEZE_QUANTITY = 900
+
+
+def _freeze_quantity(exchange: str, tradingsymbol: str):
+    """Max quantity the exchange allows in a single order for this contract, or None if there's
+    no freeze limit to worry about (equity cash trades have none)."""
+    if exchange not in _LOT_SIZE_EXCHANGES:
+        return None
+    symbol = tradingsymbol.upper()
+    for prefix, limit in _FREEZE_QUANTITY.items():
+        if symbol.startswith(prefix):
+            return limit
+    return _DEFAULT_FREEZE_QUANTITY
+
+
+def _slice_quantity(qty: int, lot_size: int, freeze_qty) -> list:
+    """Splits qty into a list of per-order quantities, each within the exchange's freeze limit
+    and a whole number of lots, so a single order never gets rejected for exceeding it."""
+    if not freeze_qty or qty <= freeze_qty:
+        return [qty]
+    lots_per_slice = max(freeze_qty // lot_size, 1)
+    slice_qty = lots_per_slice * lot_size
+    slices = []
+    remaining = qty
+    while remaining > 0:
+        chunk = min(slice_qty, remaining)
+        slices.append(chunk)
+        remaining -= chunk
+    return slices
+
+
+_STOPLOSS_ORDER_TYPES = {"SL", "SL-M"}
+_MIRRORABLE_ORDER_TYPES = {"LIMIT"} | _STOPLOSS_ORDER_TYPES
+
+
 def replicate_order(db: Session, master_account: models.Account, order: dict, broadcast=None):
     """
     order: a dict from Kite's order update payload, expected to contain at least
-    tradingsymbol, exchange, transaction_type, quantity, order_type, product,
+    tradingsymbol, exchange, transaction_type, quantity, order_type, variety, product,
     status, and (for completed orders) average_price.
 
-    Only replicates orders whose status is COMPLETE, to avoid copying orders
-    that may still get rejected or modified on the master side.
+    LIMIT and stoploss (SL/SL-M) orders are mirrored onto children as a live resting order the
+    moment they're actually resting on the master's book (see _handle_order_lifecycle) - this
+    also covers AMO orders placed after hours, which sit resting (status OPEN) until the next
+    session instead of filling right away, so they get queued on children immediately too
+    rather than only once the master's AMO order fills the next morning.
+
+    MARKET orders (AMO or not) are the one exception, kept on the original fill-then-copy
+    path: Kite's API rejects a raw MARKET order outright (see _protected_limit_price), so there
+    is no broker-supported "resting" order to place ahead of time - and pre-computing a
+    protected limit price hours before an overnight AMO order would even reach the exchange
+    would risk pricing it off a stale LTP that may have gapped by the next morning's open.
+    Waiting for the master's own fill and pricing off the LTP at that moment avoids both
+    problems, at the cost of the child's order landing a beat after the master's instead of
+    resting independently.
     """
+    if order.get("order_type") in _MIRRORABLE_ORDER_TYPES:
+        _handle_order_lifecycle(db, master_account, order, broadcast)
+        return
+
     if order.get("status") != "COMPLETE":
         return
 
+    _replicate_fill(db, master_account, order, broadcast)
+
+
+def _replicate_fill(db: Session, master_account: models.Account, order: dict, broadcast=None):
+    """The original fill-then-copy path: places an immediate market-protected order on each
+    child. Used for completed regular (LIMIT/MARKET) orders, and as a fallback if a stoploss
+    order completes without ever having been mirrored (see _handle_stoploss_update)."""
     children = (
         db.query(models.Account)
         .filter(models.Account.role == "child", models.Account.active == True)  # noqa: E712
@@ -66,6 +139,7 @@ def replicate_order(db: Session, master_account: models.Account, order: dict, br
     transaction_type = order.get("transaction_type")
     instrument = _get_instrument_detail(master_kite, exchange, tradingsymbol)
     lot_size = order.get("lot_size") or (instrument or {}).get("lot_size") or _guess_lot_size(tradingsymbol)
+    freeze_qty = _freeze_quantity(exchange, tradingsymbol)
 
     for child in children:
         qty = compute_child_quantity(
@@ -84,22 +158,26 @@ def replicate_order(db: Session, master_account: models.Account, order: dict, br
             )
             continue
 
+        slices = _slice_quantity(qty, lot_size, freeze_qty)
+        note = f" (sliced into {len(slices)} orders to stay within the exchange freeze limit)" if len(slices) > 1 else ""
+
         if child.broker == "kotak_neo":
-            try:
-                child_order_id = kotak_client.place_child_order(
-                    child, exchange, tradingsymbol, transaction_type, qty,
-                    order.get("product", "MIS"), instrument,
-                )
-                log_trade_event(
-                    db, child, exchange, tradingsymbol, transaction_type, qty, "SUCCESS",
-                    "Order placed on Kotak Neo (market protection).",
-                    broadcast, master_order_id=order.get("order_id"), child_order_id=str(child_order_id),
-                )
-            except Exception as e:  # noqa: BLE001 - log and move on to the next child
-                log_trade_event(
-                    db, child, exchange, tradingsymbol, transaction_type, qty, "FAILED",
-                    str(e), broadcast, master_order_id=order.get("order_id"),
-                )
+            for slice_qty in slices:
+                try:
+                    child_order_id = kotak_client.place_child_order(
+                        child, exchange, tradingsymbol, transaction_type, slice_qty,
+                        order.get("product", "MIS"), instrument,
+                    )
+                    log_trade_event(
+                        db, child, exchange, tradingsymbol, transaction_type, slice_qty, "SUCCESS",
+                        f"Order placed on Kotak Neo (market protection){note}.",
+                        broadcast, master_order_id=order.get("order_id"), child_order_id=str(child_order_id),
+                    )
+                except Exception as e:  # noqa: BLE001 - log and move on to the next slice/child
+                    log_trade_event(
+                        db, child, exchange, tradingsymbol, transaction_type, slice_qty, "FAILED",
+                        str(e), broadcast, master_order_id=order.get("order_id"),
+                    )
             continue
 
         try:
@@ -107,27 +185,335 @@ def replicate_order(db: Session, master_account: models.Account, order: dict, br
                 api_key=crypto_utils.decrypt(child.api_key_enc),
                 access_token=crypto_utils.decrypt(child.access_token_enc),
             )
-            limit_price = _protected_limit_price(kite, exchange, tradingsymbol, transaction_type)
-            child_order_id = kite.place_order(
-                variety=kite.VARIETY_REGULAR,
-                exchange=exchange,
-                tradingsymbol=tradingsymbol,
-                transaction_type=transaction_type,
-                quantity=qty,
-                order_type=kite.ORDER_TYPE_LIMIT,
-                price=limit_price,
-                product=order.get("product", kite.PRODUCT_MIS),
-            )
-            log_trade_event(
-                db, child, exchange, tradingsymbol, transaction_type, qty, "SUCCESS",
-                f"Order placed as LIMIT @ {limit_price} (market protection).",
-                broadcast, master_order_id=order.get("order_id"), child_order_id=str(child_order_id),
-            )
-        except Exception as e:  # noqa: BLE001 - we want to log any Kite/network error and continue to next child
+        except Exception as e:  # noqa: BLE001
             log_trade_event(
                 db, child, exchange, tradingsymbol, transaction_type, qty, "FAILED",
                 str(e), broadcast, master_order_id=order.get("order_id"),
             )
+            continue
+
+        try:
+            # One LTP fetch per child, shared across slices - the slices go out back-to-back
+            # within the same moment, and Kite rate-limits quote calls.
+            limit_price = _protected_limit_price(kite, exchange, tradingsymbol, transaction_type)
+        except Exception as e:  # noqa: BLE001
+            log_trade_event(
+                db, child, exchange, tradingsymbol, transaction_type, qty, "FAILED",
+                str(e), broadcast, master_order_id=order.get("order_id"),
+            )
+            continue
+
+        for slice_qty in slices:
+            try:
+                child_order_id = kite.place_order(
+                    variety=kite.VARIETY_REGULAR,
+                    exchange=exchange,
+                    tradingsymbol=tradingsymbol,
+                    transaction_type=transaction_type,
+                    quantity=slice_qty,
+                    order_type=kite.ORDER_TYPE_LIMIT,
+                    price=limit_price,
+                    product=order.get("product", kite.PRODUCT_MIS),
+                )
+                log_trade_event(
+                    db, child, exchange, tradingsymbol, transaction_type, slice_qty, "SUCCESS",
+                    f"Order placed as LIMIT @ {limit_price} (market protection){note}.",
+                    broadcast, master_order_id=order.get("order_id"), child_order_id=str(child_order_id),
+                )
+            except Exception as e:  # noqa: BLE001 - we want to log any Kite/network error and continue to next slice
+                log_trade_event(
+                    db, child, exchange, tradingsymbol, transaction_type, slice_qty, "FAILED",
+                    str(e), broadcast, master_order_id=order.get("order_id"),
+                )
+
+
+_RESTING_STATUSES = {"OPEN", "TRIGGER PENDING", "AMO REQ RECEIVED"}
+_TERMINAL_CANCEL_STATUSES = {"CANCELLED", "REJECTED"}
+
+
+def _price_kwargs(order_type: str, price, trigger_price) -> dict:
+    """Kite only accepts price/trigger_price for the order types that actually use them -
+    passing price to a MARKET order (or trigger_price to a plain LIMIT order) is rejected."""
+    kwargs = {}
+    if order_type in ("LIMIT", "SL"):
+        kwargs["price"] = price
+    if order_type in _STOPLOSS_ORDER_TYPES:
+        kwargs["trigger_price"] = trigger_price
+    return kwargs
+
+
+def _cancel_child_mirrors(db: Session, child: models.Account, mirrors: list, exchange, tradingsymbol,
+                           transaction_type, reason: str, master_order_id, broadcast=None) -> None:
+    """Cancels every given MirroredOrder row for one child (a single master order can be split
+    into several freeze-limit slices, each its own row) and marks each CANCELLED."""
+    try:
+        kite = get_kite_client(
+            api_key=crypto_utils.decrypt(child.api_key_enc),
+            access_token=crypto_utils.decrypt(child.access_token_enc),
+        )
+    except Exception as e:  # noqa: BLE001
+        for m in mirrors:
+            log_trade_event(
+                db, child, exchange, tradingsymbol, transaction_type, m.quantity, "FAILED",
+                f"Could not cancel mirrored order: {e}", broadcast,
+                master_order_id=master_order_id, child_order_id=m.child_order_id,
+            )
+        return
+
+    for m in mirrors:
+        try:
+            kite.cancel_order(variety=m.variety, order_id=m.child_order_id)
+            m.status = "CANCELLED"
+            db.commit()
+            log_trade_event(
+                db, child, exchange, tradingsymbol, transaction_type, m.quantity, "SUCCESS",
+                reason, broadcast, master_order_id=master_order_id, child_order_id=m.child_order_id,
+            )
+        except Exception as e:  # noqa: BLE001
+            log_trade_event(
+                db, child, exchange, tradingsymbol, transaction_type, m.quantity, "FAILED",
+                f"Could not cancel mirrored order: {e}", broadcast,
+                master_order_id=master_order_id, child_order_id=m.child_order_id,
+            )
+
+
+def _place_child_slices(db: Session, child: models.Account, master_order_id, exchange, tradingsymbol,
+                         transaction_type, order_type, variety, price, trigger_price, product,
+                         slices: list, broadcast=None) -> None:
+    """Places one resting order per entry in `slices` on a Zerodha child, each staying within the
+    exchange's freeze-quantity limit, and records a MirroredOrder row per slice so later
+    modify/cancel events on the master order can find and act on all of them."""
+    try:
+        kite = get_kite_client(
+            api_key=crypto_utils.decrypt(child.api_key_enc),
+            access_token=crypto_utils.decrypt(child.access_token_enc),
+        )
+    except Exception as e:  # noqa: BLE001
+        log_trade_event(
+            db, child, exchange, tradingsymbol, transaction_type, sum(slices), "FAILED",
+            str(e), broadcast, master_order_id=master_order_id,
+        )
+        return
+
+    for i, slice_qty in enumerate(slices, start=1):
+        try:
+            child_order_id = kite.place_order(
+                variety=variety,
+                exchange=exchange,
+                tradingsymbol=tradingsymbol,
+                transaction_type=transaction_type,
+                quantity=slice_qty,
+                order_type=order_type,
+                product=product,
+                **_price_kwargs(order_type, price, trigger_price),
+            )
+            db.add(models.MirroredOrder(
+                master_order_id=master_order_id, child_account_id=child.id, child_order_id=str(child_order_id),
+                exchange=exchange, tradingsymbol=tradingsymbol, transaction_type=transaction_type,
+                order_type=order_type, variety=variety, trigger_price=trigger_price, price=price,
+                quantity=slice_qty, status="OPEN",
+            ))
+            db.commit()
+            detail = f"trigger @ {trigger_price}" if order_type in _STOPLOSS_ORDER_TYPES else f"@ {price}"
+            amo_note = " (queued as AMO for next session)" if variety == "amo" else ""
+            slice_note = f" (slice {i}/{len(slices)}, exchange freeze limit)" if len(slices) > 1 else ""
+            log_trade_event(
+                db, child, exchange, tradingsymbol, transaction_type, slice_qty, "SUCCESS",
+                f"Order mirrored as pending {order_type} {detail}{amo_note}{slice_note}.",
+                broadcast, master_order_id=master_order_id, child_order_id=str(child_order_id),
+            )
+        except Exception as e:  # noqa: BLE001
+            log_trade_event(
+                db, child, exchange, tradingsymbol, transaction_type, slice_qty, "FAILED",
+                str(e), broadcast, master_order_id=master_order_id,
+            )
+
+
+def _handle_order_lifecycle(db: Session, master_account: models.Account, order: dict, broadcast=None):
+    """
+    Mirrors a LIMIT or stoploss (SL/SL-M) order onto each active Zerodha child while it's still
+    resting on the master's book, instead of waiting for it to fill like the old fill-then-copy
+    model (_replicate_fill) - so a child's own order book actually reflects the master's: a
+    stoploss's protection or an AMO order's overnight queue position exists on the child too,
+    not just after the master's already acted on it. Kotak Neo children are skipped for now
+    (see kotak_client.py header) - place_child_order there only knows how to submit an
+    immediate market order.
+    """
+    master_order_id = order.get("order_id")
+    status = order.get("status")
+    exchange = order.get("exchange")
+    tradingsymbol = order.get("tradingsymbol", "")
+    transaction_type = order.get("transaction_type")
+    order_type = order.get("order_type")
+    variety = order.get("variety") or "regular"
+    trigger_price = order.get("trigger_price")
+    price = order.get("price")
+
+    mirrors = (
+        db.query(models.MirroredOrder)
+        .filter(models.MirroredOrder.master_order_id == master_order_id, models.MirroredOrder.status == "OPEN")
+        .all()
+    )
+
+    if status in _TERMINAL_CANCEL_STATUSES:
+        mirrors_by_child = {}
+        for m in mirrors:
+            mirrors_by_child.setdefault(m.child_account_id, []).append(m)
+        for child_id, child_mirrors in mirrors_by_child.items():
+            child = db.query(models.Account).get(child_id)
+            _cancel_child_mirrors(
+                db, child, child_mirrors, exchange, tradingsymbol, transaction_type,
+                f"Master order {status.lower()} - mirrored order cancelled on child.",
+                master_order_id, broadcast,
+            )
+        return
+
+    if status == "COMPLETE":
+        if not mirrors:
+            # No live mirror existed (e.g. this order was already resting before this feature
+            # shipped, or mirroring failed for every child) - fall back to the old
+            # fill-then-copy behaviour so the trade isn't silently dropped.
+            _replicate_fill(db, master_account, order, broadcast)
+            return
+        for m in mirrors:
+            child = db.query(models.Account).get(m.child_account_id)
+            m.status = "COMPLETE"
+            db.commit()
+            log_trade_event(
+                db, child, exchange, tradingsymbol, transaction_type, m.quantity, "SUCCESS",
+                "Master order filled - child's mirrored order should fill independently.",
+                broadcast, master_order_id=master_order_id, child_order_id=m.child_order_id,
+            )
+        return
+
+    if status not in _RESTING_STATUSES:
+        return  # OPEN PENDING / MODIFY PENDING / VALIDATION PENDING - wait for the next event
+
+    master_capital = master_account.capital or 0.0
+    master_kite = get_kite_client(
+        api_key=crypto_utils.decrypt(master_account.api_key_enc),
+        access_token=crypto_utils.decrypt(master_account.access_token_enc),
+    )
+    instrument = _get_instrument_detail(master_kite, exchange, tradingsymbol)
+    lot_size = order.get("lot_size") or (instrument or {}).get("lot_size") or _guess_lot_size(tradingsymbol)
+    freeze_qty = _freeze_quantity(exchange, tradingsymbol)
+
+    if mirrors:
+        # Already mirrored - this update is a re-confirmation or the result of a modify on the
+        # master. Bring each child's resting order(s) in line if the price/trigger/qty changed.
+        mirrors_by_child = {}
+        for m in mirrors:
+            mirrors_by_child.setdefault(m.child_account_id, []).append(m)
+
+        for child_id, child_mirrors in mirrors_by_child.items():
+            child = db.query(models.Account).get(child_id)
+            child_mirrors = sorted(child_mirrors, key=lambda m: m.id)
+            qty = compute_child_quantity(
+                master_qty=order.get("quantity", 0), master_capital=master_capital,
+                child_capital=child.capital or 0.0, lot_size=lot_size,
+                multiplier_override=child.multiplier_override,
+            )
+
+            if qty <= 0:
+                _cancel_child_mirrors(
+                    db, child, child_mirrors, exchange, tradingsymbol, transaction_type,
+                    "Master order modified down to a size this child can no longer cover "
+                    "with one lot - mirrored order cancelled.",
+                    master_order_id, broadcast,
+                )
+                continue
+
+            new_slices = _slice_quantity(qty, lot_size, freeze_qty)
+
+            if len(new_slices) != len(child_mirrors):
+                # The slice count itself changed (the order grew/shrank across a freeze-limit
+                # boundary) - simplest correct fix is to cancel every existing slice for this
+                # child and re-place fresh ones, rather than lining up modify() calls against a
+                # shifted count.
+                _cancel_child_mirrors(
+                    db, child, child_mirrors, exchange, tradingsymbol, transaction_type,
+                    "Master order modified - re-mirroring with updated slice count.",
+                    master_order_id, broadcast,
+                )
+                _place_child_slices(
+                    db, child, master_order_id, exchange, tradingsymbol, transaction_type,
+                    order_type, variety, price, trigger_price, order.get("product", "MIS"),
+                    new_slices, broadcast,
+                )
+                continue
+
+            try:
+                kite = get_kite_client(
+                    api_key=crypto_utils.decrypt(child.api_key_enc),
+                    access_token=crypto_utils.decrypt(child.access_token_enc),
+                )
+            except Exception as e:  # noqa: BLE001
+                log_trade_event(
+                    db, child, exchange, tradingsymbol, transaction_type, qty, "FAILED",
+                    f"Could not update mirrored order: {e}", broadcast,
+                    master_order_id=master_order_id,
+                )
+                continue
+
+            for m, slice_qty in zip(child_mirrors, new_slices):
+                if slice_qty == m.quantity and trigger_price == m.trigger_price and price == m.price:
+                    continue  # nothing changed for this slice - avoid a redundant modify call
+                try:
+                    kite.modify_order(
+                        variety=m.variety, order_id=m.child_order_id, quantity=slice_qty, order_type=order_type,
+                        **_price_kwargs(order_type, price, trigger_price),
+                    )
+                    m.quantity, m.trigger_price, m.price = slice_qty, trigger_price, price
+                    db.commit()
+                    log_trade_event(
+                        db, child, exchange, tradingsymbol, transaction_type, slice_qty, "SUCCESS",
+                        "Master order modified - mirrored order updated to match.",
+                        broadcast, master_order_id=master_order_id, child_order_id=m.child_order_id,
+                    )
+                except Exception as e:  # noqa: BLE001
+                    log_trade_event(
+                        db, child, exchange, tradingsymbol, transaction_type, slice_qty, "FAILED",
+                        f"Could not update mirrored order: {e}", broadcast,
+                        master_order_id=master_order_id, child_order_id=m.child_order_id,
+                    )
+        return
+
+    # No mirror yet - this is a brand-new resting order (including a freshly-queued AMO order).
+    # Place a matching one on every active child right away instead of waiting for it to fill.
+    children = (
+        db.query(models.Account)
+        .filter(models.Account.role == "child", models.Account.active == True)  # noqa: E712
+        .all()
+    )
+    for child in children:
+        qty = compute_child_quantity(
+            master_qty=order.get("quantity", 0), master_capital=master_capital,
+            child_capital=child.capital or 0.0, lot_size=lot_size,
+            multiplier_override=child.multiplier_override,
+        )
+        if qty <= 0:
+            log_trade_event(
+                db, child, exchange, tradingsymbol, transaction_type, qty, "SKIPPED",
+                "Computed replicated quantity was 0 (child capital too small for one lot).",
+                broadcast, master_order_id=master_order_id,
+            )
+            continue
+
+        if child.broker == "kotak_neo":
+            log_trade_event(
+                db, child, exchange, tradingsymbol, transaction_type, qty, "SKIPPED",
+                "Live order mirroring isn't supported for Kotak Neo children yet - this order "
+                "will only be copied to this child once it fills on the master.",
+                broadcast, master_order_id=master_order_id,
+            )
+            continue
+
+        slices = _slice_quantity(qty, lot_size, freeze_qty)
+        _place_child_slices(
+            db, child, master_order_id, exchange, tradingsymbol, transaction_type,
+            order_type, variety, price, trigger_price, order.get("product", "MIS"),
+            slices, broadcast,
+        )
 
 
 _OPEN_ORDER_STATUSES = {"OPEN", "TRIGGER PENDING", "MODIFY PENDING", "OPEN PENDING", "VALIDATION PENDING"}
@@ -187,27 +573,44 @@ def exit_account(db: Session, account: models.Account, broadcast=None) -> list:
         tradingsymbol = pos["tradingsymbol"]
         transaction_type = kite.TRANSACTION_TYPE_SELL if qty > 0 else kite.TRANSACTION_TYPE_BUY
         exit_qty = abs(qty)
+
+        instrument = _get_instrument_detail(kite, exchange, tradingsymbol)
+        lot_size = (instrument or {}).get("lot_size") or _guess_lot_size(tradingsymbol)
+        freeze_qty = _freeze_quantity(exchange, tradingsymbol)
+        slices = _slice_quantity(exit_qty, lot_size, freeze_qty)
+        note = f" (sliced into {len(slices)} orders to stay within the exchange freeze limit)" if len(slices) > 1 else ""
+
         try:
+            # One LTP fetch per position, shared across slices (same reasoning as _replicate_fill).
             limit_price = _protected_limit_price(kite, exchange, tradingsymbol, transaction_type)
-            order_id = kite.place_order(
-                variety=kite.VARIETY_REGULAR,
-                exchange=exchange,
-                tradingsymbol=tradingsymbol,
-                transaction_type=transaction_type,
-                quantity=exit_qty,
-                order_type=kite.ORDER_TYPE_LIMIT,
-                price=limit_price,
-                product=pos.get("product", kite.PRODUCT_MIS),
-            )
-            results.append(log_trade_event(
-                db, account, exchange, tradingsymbol, transaction_type, exit_qty,
-                "SUCCESS", f"Exited @ {limit_price} (order {order_id}).", broadcast,
-            ))
         except Exception as e:  # noqa: BLE001
             results.append(log_trade_event(
                 db, account, exchange, tradingsymbol, transaction_type, exit_qty,
                 "FAILED", str(e), broadcast,
             ))
+            continue
+
+        for slice_qty in slices:
+            try:
+                order_id = kite.place_order(
+                    variety=kite.VARIETY_REGULAR,
+                    exchange=exchange,
+                    tradingsymbol=tradingsymbol,
+                    transaction_type=transaction_type,
+                    quantity=slice_qty,
+                    order_type=kite.ORDER_TYPE_LIMIT,
+                    price=limit_price,
+                    product=pos.get("product", kite.PRODUCT_MIS),
+                )
+                results.append(log_trade_event(
+                    db, account, exchange, tradingsymbol, transaction_type, slice_qty,
+                    "SUCCESS", f"Exited @ {limit_price} (order {order_id}){note}.", broadcast,
+                ))
+            except Exception as e:  # noqa: BLE001
+                results.append(log_trade_event(
+                    db, account, exchange, tradingsymbol, transaction_type, slice_qty,
+                    "FAILED", str(e), broadcast,
+                ))
 
     return results
 

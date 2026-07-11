@@ -35,6 +35,18 @@ def log_trade_event(db: Session, account: models.Account, exchange, tradingsymbo
     return payload
 
 
+def today_ist_start_utc(now_utc: datetime.datetime = None) -> datetime.datetime:
+    """Start of the current day in IST (where this app's users actually trade), expressed as a
+    naive UTC datetime so it can be compared directly against TradeLog.timestamp (naive UTC,
+    see to_dict's "Z"-suffix comment) - used to scope the live feed to just today's trades
+    without deleting older rows. `now_utc` defaults to the real current time; overridable for
+    tests."""
+    now_utc = now_utc or datetime.datetime.utcnow()
+    ist_now = now_utc + datetime.timedelta(hours=5, minutes=30)
+    ist_midnight = ist_now.replace(hour=0, minute=0, second=0, microsecond=0)
+    return ist_midnight - datetime.timedelta(hours=5, minutes=30)
+
+
 def to_dict(log: "models.TradeLog", account_label: str) -> dict:
     # log.timestamp is always naive UTC (set via datetime.utcnow()) - append "Z" explicitly so
     # the frontend's `new Date(...)` parses it as UTC and converts to the viewer's local time
