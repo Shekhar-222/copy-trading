@@ -16,3 +16,16 @@ cryptography==42.0.8
 # you reinstall websockets==12.0 afterward - FastAPI/uvicorn's own /ws/live endpoint needs the
 # newer version. Always run `pip install websockets==12.0` again right after installing neo_api_client.
 neo_api_client @ git+https://github.com/Kotak-Neo/Kotak-neo-api-v2.git@v2.0.2#egg=neo_api_client
+
+# Angel One (SmartAPI) broker support - unlike Kotak Neo's SDK, this one is on PyPI.
+# NOTE: the import name has changed across versions of this package (`from SmartApi import
+# SmartConnect` on recent releases, `from smartapi import SmartConnect` on older ones) -
+# angel_auth.py uses the newer `SmartApi` import; if it fails with ModuleNotFoundError, check
+# which one the installed version actually provides. Also check, same as neo_api_client above,
+# whether its own dependencies downgrade the websockets pin - reinstall websockets==12.0 after
+# installing this if so.
+smartapi-python==1.5.5
+# smartapi-python==1.5.5 imports logzero at module load time but doesn't declare it as a pip
+# dependency (confirmed on install: `from SmartApi import SmartConnect` raises
+# ModuleNotFoundError: No module named 'logzero' without this line).
+logzero==1.7.0

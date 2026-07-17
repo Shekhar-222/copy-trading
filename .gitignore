@@ -3,6 +3,8 @@ backend/.env
 backend/*.db
 backend/*.log
 backend/backups/
+backend/.angel_scrip_master_cache.json
+backend/logs/
 node_modules/
 frontend/dist/
 frontend/*.log

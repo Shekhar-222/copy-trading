@@ -18,6 +18,9 @@ from database import engine, get_db, Base, SessionLocal, backup_sqlite_db
 from kite_auth import auto_generate_request_token, generate_access_token, get_kite_client, LoginError
 from kotak_auth import get_kotak_client, KotakLoginError
 import kotak_client
+import angel_auth
+from angel_auth import AngelLoginError
+import angel_client
 from ticker_listener import start_master_listener, stop_master_listener, is_running
 from replication_engine import exit_account
 import trade_log
@@ -172,14 +175,14 @@ async def live_updates(ws: WebSocket):
 class AccountCreate(BaseModel):
     label: str
     role: str  # "master" or "child"
-    broker: str = "zerodha"  # "zerodha" or "kotak_neo"
-    client_id: str  # Kite client id, or Kotak Neo UCC
-    api_key: str  # Kite api_key, or Kotak Neo consumer_key
-    api_secret: Optional[str] = None  # Kite api_secret (required for zerodha, unused for kotak_neo)
+    broker: str = "zerodha"  # "zerodha", "kotak_neo", or "angel_one"
+    client_id: str  # Kite client id, Kotak Neo UCC, or Angel One client code
+    api_key: str  # Kite api_key, Kotak Neo consumer_key, or Angel One SmartAPI api_key
+    api_secret: Optional[str] = None  # Kite api_secret (required for zerodha, unused otherwise)
     password: Optional[str] = None  # Zerodha login password - only used for zerodha auto-login
     totp_secret: str
-    mpin: Optional[str] = None  # Kotak Neo MPIN - required for kotak_neo
-    mobile_number: Optional[str] = None  # Kotak Neo registered mobile number - required for kotak_neo
+    mpin: Optional[str] = None  # Kotak Neo MPIN / Angel One trading PIN - required for those brokers
+    mobile_number: Optional[str] = None  # Kotak Neo registered mobile number - required for kotak_neo only
     multiplier_override: Optional[float] = None
 
 
@@ -240,28 +243,39 @@ def _to_out(acc: models.Account) -> dict:
 def create_account(payload: AccountCreate, db: Session = Depends(get_db)):
     if payload.role not in ("master", "child"):
         raise HTTPException(400, "role must be 'master' or 'child'")
-    if payload.broker not in ("zerodha", "kotak_neo"):
-        raise HTTPException(400, "broker must be 'zerodha' or 'kotak_neo'")
+    if payload.broker not in ("zerodha", "kotak_neo", "angel_one"):
+        raise HTTPException(400, "broker must be 'zerodha', 'kotak_neo', or 'angel_one'")
     if payload.broker == "kotak_neo":
         if payload.role != "child":
             raise HTTPException(400, "Kotak Neo accounts can only be added as child accounts for now.")
         if not payload.mpin or not payload.mobile_number:
             raise HTTPException(400, "mpin and mobile_number are required for Kotak Neo accounts.")
+    elif payload.broker == "angel_one":
+        if payload.role != "child":
+            raise HTTPException(400, "Angel One accounts can only be added as child accounts for now.")
+        if not payload.mpin:
+            raise HTTPException(400, "mpin (trading PIN) is required for Angel One accounts.")
     else:
         if not payload.api_secret:
             raise HTTPException(400, "api_secret is required for Zerodha accounts.")
 
+    # Stripped: these are typically copy-pasted from a broker's app/website, and a stray
+    # leading/trailing space (e.g. from a triple-click copy) is invisible in the input box but
+    # breaks things downstream - a totp_secret with a trailing space fails pyotp's base32
+    # decode outright ("Non-base32 digit found"), confirmed against a real Angel One account.
+    # password isn't stripped since it's typically typed, not pasted, and unlike an API
+    # key/secret a password is occasionally intentionally whitespace-containing.
     acc = models.Account(
         label=payload.label,
         role=payload.role,
         broker=payload.broker,
-        client_id=payload.client_id,
-        api_key_enc=crypto_utils.encrypt(payload.api_key),
-        api_secret_enc=crypto_utils.encrypt(payload.api_secret or ""),
+        client_id=payload.client_id.strip(),
+        api_key_enc=crypto_utils.encrypt(payload.api_key.strip()),
+        api_secret_enc=crypto_utils.encrypt((payload.api_secret or "").strip()),
         password_enc=crypto_utils.encrypt(payload.password) if payload.password else None,
-        totp_secret_enc=crypto_utils.encrypt(payload.totp_secret),
-        mpin_enc=crypto_utils.encrypt(payload.mpin) if payload.mpin else None,
-        mobile_number=payload.mobile_number,
+        totp_secret_enc=crypto_utils.encrypt(payload.totp_secret.strip()),
+        mpin_enc=crypto_utils.encrypt(payload.mpin.strip()) if payload.mpin else None,
+        mobile_number=payload.mobile_number.strip() if payload.mobile_number else None,
         multiplier_override=payload.multiplier_override,
     )
     db.add(acc)
@@ -299,10 +313,10 @@ def set_multiplier(account_id: int, payload: MultiplierIn, db: Session = Depends
 
 @app.patch("/accounts/{account_id}/role")
 def switch_role(account_id: int, payload: RoleIn, db: Session = Depends(get_db)):
-    """Switches an existing account between master and child. Kotak Neo accounts can't become
-    a master (the order-update feed that drives replication only exists for Zerodha) and an
-    account must be toggled off/excluded first, so a live listener or in-flight copying never
-    gets yanked out from under it mid-switch."""
+    """Switches an existing account between master and child. Kotak Neo and Angel One accounts
+    can't become a master (the order-update feed that drives replication only exists for
+    Zerodha) and an account must be toggled off/excluded first, so a live listener or
+    in-flight copying never gets yanked out from under it mid-switch."""
     acc = db.query(models.Account).get(account_id)
     if not acc:
         raise HTTPException(404, "not found")
@@ -312,8 +326,8 @@ def switch_role(account_id: int, payload: RoleIn, db: Session = Depends(get_db))
         return _to_out(acc)
     if acc.active:
         raise HTTPException(400, "Stop trading / exclude this account before switching its role.")
-    if payload.role == "master" and acc.broker == "kotak_neo":
-        raise HTTPException(400, "Kotak Neo accounts can only be children - the master must be Zerodha.")
+    if payload.role == "master" and acc.broker in ("kotak_neo", "angel_one"):
+        raise HTTPException(400, "Kotak Neo and Angel One accounts can only be children - the master must be Zerodha.")
 
     if acc.role == "master":
         stop_master_listener(acc.id)
@@ -340,10 +354,13 @@ def toggle_active(account_id: int, db: Session = Depends(get_db)):
 # ---------------------------- Daily login / token ----------------------------
 @app.post("/accounts/{account_id}/auto-login")
 def auto_login(account_id: int, db: Session = Depends(get_db)):
-    """Zerodha: attempts fully automated login using stored password + TOTP secret. Kotak
-    Neo: logs in fresh with TOTP + MPIN (no password needed, no SMS OTP involved) - see
-    kotak_auth.py. Both paths finish by refreshing capital and, for a Zerodha master, starting
-    the order-update listener."""
+    """Zerodha: attempts fully automated login using stored password + TOTP secret, storing a
+    daily access token. Angel One: logs in fresh with TOTP + PIN once and stores the resulting
+    access/refresh token pair the same way (see angel_auth.py) - every other Angel One action
+    reuses those stored tokens rather than logging in again. Kotak Neo: logs in fresh with
+    TOTP + MPIN on every action instead (see kotak_auth.py), since its SDK has no equivalent
+    stored-token reattachment. All paths finish by refreshing capital and, for a Zerodha
+    master, starting the order-update listener."""
     acc = db.query(models.Account).get(account_id)
     if not acc:
         raise HTTPException(404, "not found")
@@ -361,6 +378,36 @@ def auto_login(account_id: int, db: Session = Depends(get_db)):
             raise HTTPException(400, f"Kotak Neo login failed: {e}")
 
         acc.access_token_enc = crypto_utils.encrypt("kotak-neo-verified")
+        acc.token_generated_at = datetime.datetime.utcnow()
+        db.commit()
+        _refresh_capital(acc, db)
+        return _to_out(acc)
+
+    if acc.broker == "angel_one":
+        # Logs in fresh exactly once here (the only place angel_auth.login() is called) and
+        # persists the resulting access/refresh token pair - every other Angel One action
+        # (including the _refresh_capital call right below) reconstructs a client from these
+        # stored tokens instead of logging in again, since Angel's login endpoint is rate-
+        # limited tightly enough that repeated fresh logins get rejected (see angel_auth.py).
+        try:
+            token_data = angel_auth.login(
+                api_key=crypto_utils.decrypt(acc.api_key_enc),
+                client_id=acc.client_id,
+                totp_secret=crypto_utils.decrypt(acc.totp_secret_enc),
+                pin=crypto_utils.decrypt(acc.mpin_enc),
+            )
+        except AngelLoginError as e:
+            raise HTTPException(400, f"Angel One login failed: {e}")
+
+        # generateSession's jwtToken comes back already prefixed "Bearer " (confirmed live) -
+        # stored stripped so it's clean at rest; angel_auth.get_angel_client also strips
+        # defensively on the read side, so this isn't the only thing standing between a bad
+        # token and every subsequent call failing with "Invalid Token".
+        jwt_token = token_data.get("jwtToken", "")
+        if jwt_token.strip().lower().startswith("bearer "):
+            jwt_token = jwt_token.strip()[len("bearer "):].strip()
+        acc.access_token_enc = crypto_utils.encrypt(jwt_token)
+        acc.api_secret_enc = crypto_utils.encrypt(token_data.get("refreshToken", ""))
         acc.token_generated_at = datetime.datetime.utcnow()
         db.commit()
         _refresh_capital(acc, db)
@@ -400,12 +447,13 @@ def auto_login(account_id: int, db: Session = Depends(get_db)):
 def get_login_url(account_id: int, db: Session = Depends(get_db)):
     """Returns the URL you should open in a browser, log in manually, then copy the
     request_token from the redirected URL and POST it to /accounts/{id}/manual-token.
-    Zerodha only - Kotak Neo's TOTP+MPIN login has no manual/browser step, use auto-login."""
+    Zerodha only - Kotak Neo's and Angel One's TOTP+PIN logins have no manual/browser step,
+    use auto-login."""
     acc = db.query(models.Account).get(account_id)
     if not acc:
         raise HTTPException(404, "not found")
-    if acc.broker == "kotak_neo":
-        raise HTTPException(400, "Kotak Neo doesn't use a manual-token login flow - use auto-login instead.")
+    if acc.broker in ("kotak_neo", "angel_one"):
+        raise HTTPException(400, "This broker doesn't use a manual-token login flow - use auto-login instead.")
     api_key = crypto_utils.decrypt(acc.api_key_enc)
     return {"login_url": f"https://kite.zerodha.com/connect/login?api_key={api_key}&v=3"}
 
@@ -415,8 +463,8 @@ def manual_token(account_id: int, payload: ManualTokenIn, db: Session = Depends(
     acc = db.query(models.Account).get(account_id)
     if not acc:
         raise HTTPException(404, "not found")
-    if acc.broker == "kotak_neo":
-        raise HTTPException(400, "Kotak Neo doesn't use a manual-token login flow - use auto-login instead.")
+    if acc.broker in ("kotak_neo", "angel_one"):
+        raise HTTPException(400, "This broker doesn't use a manual-token login flow - use auto-login instead.")
     try:
         access_token = generate_access_token(
             api_key=crypto_utils.decrypt(acc.api_key_enc),
@@ -459,6 +507,15 @@ def _refresh_capital(acc: models.Account, db: Session):
         db.commit()
         return
 
+    if acc.broker == "angel_one":
+        acc.capital = angel_client.get_margin(acc)
+        try:
+            acc.real_name = angel_client.get_profile_name(acc)
+        except Exception:
+            pass
+        db.commit()
+        return
+
     kite = get_kite_client(crypto_utils.decrypt(acc.api_key_enc), crypto_utils.decrypt(acc.access_token_enc))
     margins = kite.margins()
     # "net" (cash + collateral - utilised) reflects true usable capital, including pledged-stock
@@ -477,8 +534,8 @@ def _refresh_capital(acc: models.Account, db: Session):
 @app.post("/accounts/{account_id}/exit")
 def exit_positions(account_id: int, db: Session = Depends(get_db)):
     """Cancels every pending order and squares off every open position on this one account.
-    For Kotak Neo accounts, only pending-order cancellation is automated for now - see
-    kotak_client.exit_account."""
+    For Kotak Neo and Angel One accounts, only pending-order cancellation is automated for
+    now - see kotak_client.exit_account / angel_client.exit_account."""
     acc = db.query(models.Account).get(account_id)
     if not acc:
         raise HTTPException(404, "not found")
@@ -503,6 +560,8 @@ def get_positions(account_id: int, db: Session = Depends(get_db)):
     try:
         if acc.broker == "kotak_neo":
             return kotak_client.get_positions(acc)
+        if acc.broker == "angel_one":
+            return angel_client.get_positions(acc)
         kite = get_kite_client(crypto_utils.decrypt(acc.api_key_enc), crypto_utils.decrypt(acc.access_token_enc))
         positions = kite.positions().get("net", [])
         return [
@@ -561,7 +620,8 @@ def get_logs(limit: int = 100, db: Session = Depends(get_db)):
 def get_pnl(db: Session = Depends(get_db)):
     """Live running P&L per account, pulled from open positions. Kotak Neo's figure is
     best-effort (see kotak_client.get_pnl) since its positions API doesn't return a ready-made
-    PnL the way Kite's does."""
+    PnL the way Kite's does; Angel One's (see angel_client.get_pnl) is summed from its own
+    documented "pnl" field."""
     accounts = db.query(models.Account).all()
     out = []
     total = 0.0
@@ -571,6 +631,8 @@ def get_pnl(db: Session = Depends(get_db)):
             try:
                 if acc.broker == "kotak_neo":
                     pnl = kotak_client.get_pnl(acc)
+                elif acc.broker == "angel_one":
+                    pnl = angel_client.get_pnl(acc)
                 else:
                     kite = get_kite_client(crypto_utils.decrypt(acc.api_key_enc), crypto_utils.decrypt(acc.access_token_enc))
                     positions = kite.positions()

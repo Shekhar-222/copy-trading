@@ -3,9 +3,10 @@ Core copy-trading logic.
 
 When the master account places/completes an order, this module works out the
 proportional quantity for each active child account (based on capital ratio)
-and places a matching order on that child's Kite (Zerodha) or Kotak Neo account -
-the master is always Zerodha (that's where the order-update feed comes from), but
-children can be either broker. See kotak_client.py for the Kotak Neo side.
+and places a matching order on that child's Kite (Zerodha), Kotak Neo, or Angel
+One account - the master is always Zerodha (that's where the order-update feed
+comes from), but children can be any of the three. See kotak_client.py / angel_client.py
+for the Kotak Neo / Angel One sides.
 """
 import math
 import datetime
@@ -14,6 +15,7 @@ from sqlalchemy.orm import Session
 import models
 import crypto_utils
 import kotak_client
+import angel_client
 from kite_auth import get_kite_client
 from trade_log import log_trade_event
 
@@ -210,6 +212,25 @@ def _replicate_fill(db: Session, master_account: models.Account, order: dict, br
                     )
             continue
 
+        if child.broker == "angel_one":
+            for slice_qty in slices:
+                try:
+                    child_order_id = angel_client.place_child_order(
+                        child, exchange, tradingsymbol, transaction_type, slice_qty,
+                        order.get("product", "MIS"), instrument,
+                    )
+                    log_trade_event(
+                        db, child, exchange, tradingsymbol, transaction_type, slice_qty, "SUCCESS",
+                        f"Order placed on Angel One (market protection){note}.",
+                        broadcast, master_order_id=order.get("order_id"), child_order_id=str(child_order_id),
+                    )
+                except Exception as e:  # noqa: BLE001 - log and move on to the next slice/child
+                    log_trade_event(
+                        db, child, exchange, tradingsymbol, transaction_type, slice_qty, "FAILED",
+                        str(e), broadcast, master_order_id=order.get("order_id"),
+                    )
+            continue
+
         try:
             kite = get_kite_client(
                 api_key=crypto_utils.decrypt(child.api_key_enc),
@@ -365,9 +386,9 @@ def _handle_order_lifecycle(db: Session, master_account: models.Account, order: 
     resting on the master's book, instead of waiting for it to fill like the old fill-then-copy
     model (_replicate_fill) - so a child's own order book actually reflects the master's: a
     stoploss's protection or an AMO order's overnight queue position exists on the child too,
-    not just after the master's already acted on it. Kotak Neo children are skipped for now
-    (see kotak_client.py header) - place_child_order there only knows how to submit an
-    immediate market order.
+    not just after the master's already acted on it. Kotak Neo and Angel One children are
+    skipped for now (see kotak_client.py / angel_client.py headers) - their place_child_order
+    only knows how to submit an immediate market-protected order.
     """
     master_order_id = order.get("order_id")
     status = order.get("status")
@@ -529,10 +550,11 @@ def _handle_order_lifecycle(db: Session, master_account: models.Account, order: 
             )
             continue
 
-        if child.broker == "kotak_neo":
+        if child.broker in ("kotak_neo", "angel_one"):
+            broker_label = "Kotak Neo" if child.broker == "kotak_neo" else "Angel One"
             log_trade_event(
                 db, child, exchange, tradingsymbol, transaction_type, qty, "SKIPPED",
-                "Live order mirroring isn't supported for Kotak Neo children yet - this order "
+                f"Live order mirroring isn't supported for {broker_label} children yet - this order "
                 "will only be copied to this child once it fills on the master.",
                 broadcast, master_order_id=master_order_id,
             )
@@ -556,11 +578,14 @@ def exit_account(db: Session, account: models.Account, broadcast=None) -> list:
     places an opposite protected LIMIT order against every open net position. Independent of
     the master/child replication flow - works the same for a master or a child account.
 
-    Kotak Neo accounts are delegated to kotak_client.exit_account, which only cancels pending
-    orders and does not auto-square-off positions - see that function's docstring for why.
+    Kotak Neo and Angel One accounts are delegated to kotak_client.exit_account /
+    angel_client.exit_account, which only cancel pending orders and do not auto-square-off
+    positions - see those functions' docstrings for why.
     """
     if account.broker == "kotak_neo":
         return kotak_client.exit_account(db, account, broadcast=broadcast)
+    if account.broker == "angel_one":
+        return angel_client.exit_account(db, account, broadcast=broadcast)
 
     kite = get_kite_client(
         api_key=crypto_utils.decrypt(account.api_key_enc),

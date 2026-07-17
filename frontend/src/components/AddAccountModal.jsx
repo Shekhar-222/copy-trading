@@ -12,11 +12,11 @@ export default function AddAccountModal({ onClose, onCreate }) {
 
   const setBroker = (e) => {
     const broker = e.target.value
-    // Kotak Neo is child-only for now - force role and drop the now-irrelevant fields.
+    // Kotak Neo and Angel One are child-only for now - force role and drop irrelevant fields.
     setForm({
       ...form,
       broker,
-      role: broker === 'kotak_neo' ? 'child' : form.role,
+      role: broker === 'kotak_neo' || broker === 'angel_one' ? 'child' : form.role,
       api_secret: '', password: '', mpin: '', mobile_number: '',
     })
   }
@@ -41,9 +41,12 @@ export default function AddAccountModal({ onClose, onCreate }) {
   }
 
   const isKotak = form.broker === 'kotak_neo'
-  const canSave = form.label && form.client_id && (isKotak
-    ? form.api_key && form.totp_secret && form.mpin && form.mobile_number
-    : form.api_key && form.api_secret && form.totp_secret)
+  const isAngel = form.broker === 'angel_one'
+  const canSave = form.label && form.client_id && (
+    isKotak ? form.api_key && form.totp_secret && form.mpin && form.mobile_number
+    : isAngel ? form.api_key && form.totp_secret && form.mpin
+    : form.api_key && form.api_secret && form.totp_secret
+  )
 
   return (
     <div className="modal-backdrop" onClick={onClose}>
@@ -55,10 +58,48 @@ export default function AddAccountModal({ onClose, onCreate }) {
           <select value={form.broker} onChange={setBroker}>
             <option value="zerodha">Zerodha (Kite Connect)</option>
             <option value="kotak_neo">Kotak Neo</option>
+            <option value="angel_one">Angel One</option>
           </select>
         </div>
 
-        {isKotak ? (
+        {isAngel ? (
+          <>
+            <p className="hint">
+              Angel One accounts can only be added as child accounts for now (the master feed stays on Zerodha).
+              Create a SmartAPI app at smartapi.angelbroking.com for the API key, and complete TOTP registration
+              on the Angel One app too.
+            </p>
+            <div className="warning-box">
+              Trading PIN and TOTP secret are encrypted at rest, but only run this on a machine you trust — Angel
+              One login has no manual/browser fallback, it always uses these credentials directly.
+            </div>
+
+            <div className="field">
+              <label>Label</label>
+              <input placeholder="e.g. Angel One child" value={form.label} onChange={set('label')} />
+            </div>
+            <div className="field">
+              <label>Role</label>
+              <input value="Child (receives copied trades)" disabled />
+            </div>
+            <div className="field">
+              <label>Client code</label>
+              <input placeholder="e.g. A123456" value={form.client_id} onChange={set('client_id')} />
+            </div>
+            <div className="field">
+              <label>SmartAPI key</label>
+              <input value={form.api_key} onChange={set('api_key')} />
+            </div>
+            <div className="field">
+              <label>TOTP secret (base32, from Angel One TOTP registration)</label>
+              <input value={form.totp_secret} onChange={set('totp_secret')} />
+            </div>
+            <div className="field">
+              <label>Trading PIN</label>
+              <input type="password" value={form.mpin} onChange={set('mpin')} />
+            </div>
+          </>
+        ) : isKotak ? (
           <>
             <p className="hint">
               Kotak Neo accounts can only be added as child accounts for now (the master feed stays on Zerodha).

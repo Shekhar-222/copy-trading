@@ -33,7 +33,8 @@ export default function ChildCard({ account, masterCapital, pnl, onToggle, onLog
         </span>
       </div>
       <div className="id" style={{ marginTop: -6 }}>
-        {account.client_id} · child · {account.broker === 'kotak_neo' ? 'Kotak Neo' : 'Zerodha'}
+        {account.client_id} · child ·{' '}
+        {account.broker === 'kotak_neo' ? 'Kotak Neo' : account.broker === 'angel_one' ? 'Angel One' : 'Zerodha'}
       </div>
       {account.real_name && (
         <div className="real-name" title="Fetched from the Zerodha profile">
@@ -87,7 +88,7 @@ export default function ChildCard({ account, masterCapital, pnl, onToggle, onLog
         {!account.has_token_today && (
           <>
             <button className="btn small" onClick={() => onLogin(account.id)}>Auto-login</button>
-            {account.broker !== 'kotak_neo' && (
+            {account.broker !== 'kotak_neo' && account.broker !== 'angel_one' && (
               <button className="btn small" onClick={() => onManualLogin(account)}>Manual token</button>
             )}
           </>
@@ -104,7 +105,7 @@ export default function ChildCard({ account, masterCapital, pnl, onToggle, onLog
         <button className="btn small danger" disabled={!account.has_token_today} onClick={() => onExit(account)}>
           Exit all
         </button>
-        {account.broker !== 'kotak_neo' && (
+        {account.broker !== 'kotak_neo' && account.broker !== 'angel_one' && (
           <button
             className="btn small"
             disabled={account.active}

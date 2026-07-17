@@ -238,6 +238,19 @@ def test_kotak_neo_child_is_skipped_with_an_explicit_message(db_session, fake_ki
     assert db_session.query(models.MirroredOrder).count() == 0
 
 
+def test_angel_one_child_is_skipped_with_an_explicit_message(db_session, fake_kites):
+    master = make_account(db_session, "master", "master")
+    make_account(db_session, "angelchild", "child", broker="angel_one", mpin="1234")
+
+    replication_engine.replicate_order(db_session, master, sl_order())
+
+    logs = db_session.query(models.TradeLog).all()
+    assert len(logs) == 1
+    assert logs[0].status == "SKIPPED"
+    assert "Angel One" in logs[0].message
+    assert db_session.query(models.MirroredOrder).count() == 0
+
+
 # ---------------------------- Plain LIMIT (incl. AMO) ----------------------------
 
 def test_new_open_limit_order_is_mirrored_at_the_same_price(db_session, fake_kites):
