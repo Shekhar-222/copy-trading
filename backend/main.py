@@ -144,16 +144,25 @@ async def _broadcast_async(payload: dict):
 
 @app.websocket("/ws/live")
 async def live_updates(ws: WebSocket):
-    # Browsers can't set custom headers on a WebSocket handshake, so the token travels as a
-    # query param here instead of the X-Access-Token header the HTTP middleware checks.
-    if APP_ACCESS_TOKEN and not _token_matches(ws.query_params.get("token")):
-        await ws.close(code=4401)
-        return
     await ws.accept()
+    if APP_ACCESS_TOKEN:
+        # Browsers can't set custom headers on a WebSocket handshake, so the token travels as
+        # the first message instead of the X-Access-Token header the HTTP middleware checks -
+        # deliberately NOT a query param, since uvicorn's default access log writes the full
+        # request path (including query string) to stdout on every connection, which would
+        # leak the token in plaintext to whatever's reading the process logs.
+        try:
+            first_message = await asyncio.wait_for(ws.receive_text(), timeout=10)
+        except (asyncio.TimeoutError, WebSocketDisconnect):
+            await ws.close(code=4401)
+            return
+        if not _token_matches(first_message):
+            await ws.close(code=4401)
+            return
     _ws_clients.append(ws)
     try:
         while True:
-            await ws.receive_text()  # we don't expect client messages, just keep the connection open
+            await ws.receive_text()  # we don't expect further client messages, just keep the connection open
     except WebSocketDisconnect:
         if ws in _ws_clients:
             _ws_clients.remove(ws)
@@ -197,6 +206,10 @@ class ManualTokenIn(BaseModel):
 
 class MultiplierIn(BaseModel):
     multiplier_override: Optional[float] = None
+
+
+class RoleIn(BaseModel):
+    role: str  # "master" or "child"
 
 
 # ---------------------------- Helpers ----------------------------
@@ -280,6 +293,31 @@ def set_multiplier(account_id: int, payload: MultiplierIn, db: Session = Depends
     if not acc:
         raise HTTPException(404, "not found")
     acc.multiplier_override = payload.multiplier_override
+    db.commit()
+    return _to_out(acc)
+
+
+@app.patch("/accounts/{account_id}/role")
+def switch_role(account_id: int, payload: RoleIn, db: Session = Depends(get_db)):
+    """Switches an existing account between master and child. Kotak Neo accounts can't become
+    a master (the order-update feed that drives replication only exists for Zerodha) and an
+    account must be toggled off/excluded first, so a live listener or in-flight copying never
+    gets yanked out from under it mid-switch."""
+    acc = db.query(models.Account).get(account_id)
+    if not acc:
+        raise HTTPException(404, "not found")
+    if payload.role not in ("master", "child"):
+        raise HTTPException(400, "role must be 'master' or 'child'")
+    if payload.role == acc.role:
+        return _to_out(acc)
+    if acc.active:
+        raise HTTPException(400, "Stop trading / exclude this account before switching its role.")
+    if payload.role == "master" and acc.broker == "kotak_neo":
+        raise HTTPException(400, "Kotak Neo accounts can only be children - the master must be Zerodha.")
+
+    if acc.role == "master":
+        stop_master_listener(acc.id)
+    acc.role = payload.role
     db.commit()
     return _to_out(acc)
 

@@ -1,5 +1,5 @@
 import { useEffect, useState, useRef, useCallback } from 'react'
-import { api } from './api'
+import { api, accessToken } from './api'
 import MasterCard from './components/MasterCard'
 import ChildCard from './components/ChildCard'
 import PnlBadge from './components/PnlBadge'
@@ -35,9 +35,16 @@ export default function App() {
   useEffect(() => {
     load()
     const ws = new WebSocket(api.wsUrl())
+    ws.onopen = () => {
+      const token = accessToken.get()
+      if (token) ws.send(token) // first message doubles as the WS auth handshake - see main.py
+    }
     ws.onmessage = (evt) => {
       const payload = JSON.parse(evt.data)
-      if (payload.status) {
+      if (payload.event === 'pnl') {
+        // tick-driven P&L push - swap state directly, no REST round-trip
+        setPnl(payload)
+      } else if (payload.status) {
         setLogs((prev) => [payload, ...prev].slice(0, 200))
         api.getPnl().then(setPnl)
       } else {
@@ -68,6 +75,10 @@ export default function App() {
   }
   const handleDelete = async (id) => { await api.deleteAccount(id); await load() }
   const handleToggle = async (id) => { await api.toggleActive(id); await load() }
+  const handleSwitchRole = async (id, role) => {
+    try { await api.switchRole(id, role); await load() }
+    catch (e) { alert(e.message) }
+  }
   const handleAutoLogin = async (id) => {
     try { await api.autoLogin(id); await load() }
     catch (e) { alert(e.message) }
@@ -117,6 +128,7 @@ export default function App() {
             onDelete={setDeleteTarget}
             onExit={setExitTarget}
             onShowPositions={setPositionsTarget}
+            onSwitchRole={handleSwitchRole}
           />
         ))}
 
@@ -141,6 +153,7 @@ export default function App() {
                 onSetMultiplier={handleSetMultiplier}
                 onExit={setExitTarget}
                 onShowPositions={setPositionsTarget}
+                onSwitchRole={handleSwitchRole}
               />
             ))}
           </div>

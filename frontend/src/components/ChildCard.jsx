@@ -1,7 +1,7 @@
 import { useState } from 'react'
 import PnlBadge from './PnlBadge'
 
-export default function ChildCard({ account, masterCapital, pnl, onToggle, onLogin, onManualLogin, onDelete, onSetMultiplier, onExit, onShowPositions }) {
+export default function ChildCard({ account, masterCapital, pnl, onToggle, onLogin, onManualLogin, onDelete, onSetMultiplier, onExit, onShowPositions, onSwitchRole }) {
   const ratio = masterCapital > 0 ? Math.min((account.capital / masterCapital) * 100, 100) : 0
   const effectiveMultiplier = account.multiplier_override ?? (masterCapital > 0 ? account.capital / masterCapital : 0)
   const [editing, setEditing] = useState(false)
@@ -104,6 +104,16 @@ export default function ChildCard({ account, masterCapital, pnl, onToggle, onLog
         <button className="btn small danger" disabled={!account.has_token_today} onClick={() => onExit(account)}>
           Exit all
         </button>
+        {account.broker !== 'kotak_neo' && (
+          <button
+            className="btn small"
+            disabled={account.active}
+            title={account.active ? 'Exclude this account first to switch it to master' : 'Switch to master'}
+            onClick={() => onSwitchRole(account.id, 'master')}
+          >
+            Switch to master
+          </button>
+        )}
         <button className="btn small danger" onClick={() => onDelete(account)}>Remove</button>
       </div>
     </div>

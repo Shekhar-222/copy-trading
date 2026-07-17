@@ -87,6 +87,10 @@ def _slice_quantity(qty: int, lot_size: int, freeze_qty) -> list:
 _STOPLOSS_ORDER_TYPES = {"SL", "SL-M"}
 _MIRRORABLE_ORDER_TYPES = {"LIMIT"} | _STOPLOSS_ORDER_TYPES
 
+# Exchanges copy-trading is turned off for right now - master orders on these are never
+# mirrored to any child, regardless of order type or capital/multiplier settings.
+_DISABLED_EXCHANGES = {"MCX"}
+
 
 def replicate_order(db: Session, master_account: models.Account, order: dict, broadcast=None):
     """
@@ -109,11 +113,37 @@ def replicate_order(db: Session, master_account: models.Account, order: dict, br
     problems, at the cost of the child's order landing a beat after the master's instead of
     resting independently.
     """
+    exchange = order.get("exchange")
+    status = order.get("status")
+    if exchange in _DISABLED_EXCHANGES:
+        # Copy-trading is turned off for this exchange for now - log once the master's own
+        # order reaches a final state so there's a visible trace, but never mirror it to
+        # children, regardless of order type.
+        if status == "COMPLETE" or status in _TERMINAL_CANCEL_STATUSES:
+            log_trade_event(
+                db, master_account, exchange, order.get("tradingsymbol"),
+                order.get("transaction_type"), order.get("quantity"), "SKIPPED",
+                f"{exchange} copy-trading is currently disabled - order not mirrored to any child.",
+                broadcast, master_order_id=order.get("order_id"),
+            )
+        return
+
     if order.get("order_type") in _MIRRORABLE_ORDER_TYPES:
         _handle_order_lifecycle(db, master_account, order, broadcast)
         return
 
-    if order.get("status") != "COMPLETE":
+    if status != "COMPLETE":
+        if status in _TERMINAL_CANCEL_STATUSES:
+            # Otherwise a rejected/cancelled master order (e.g. commodity margin shortfall,
+            # MCX segment not enabled, MIS not allowed on that contract) vanishes with no
+            # trace anywhere - surface it against the master so it's clear nothing was
+            # copied because there was nothing to copy.
+            reason = order.get("status_message") or f"Master order was {status.lower()}."
+            log_trade_event(
+                db, master_account, order.get("exchange"), order.get("tradingsymbol"),
+                order.get("transaction_type"), order.get("quantity"), "SKIPPED", reason,
+                broadcast, master_order_id=order.get("order_id"),
+            )
         return
 
     _replicate_fill(db, master_account, order, broadcast)

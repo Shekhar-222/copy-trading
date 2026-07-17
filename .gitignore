@@ -5,6 +5,7 @@ backend/*.log
 backend/backups/
 node_modules/
 frontend/dist/
+frontend/*.log
 __pycache__/
 *.pyc
 .claude/settings.local.json

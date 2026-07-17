@@ -1,6 +1,6 @@
 import PnlBadge from './PnlBadge'
 
-export default function MasterCard({ account, listening, pnl, onToggle, onLogin, onManualLogin, onDelete, onExit, onShowPositions }) {
+export default function MasterCard({ account, listening, pnl, onToggle, onLogin, onManualLogin, onDelete, onExit, onShowPositions, onSwitchRole }) {
   const pillClass = listening ? 'live' : account.has_token_today ? 'off' : 'stale'
   const pillText = listening ? 'LISTENING' : account.has_token_today ? 'READY' : 'TOKEN EXPIRED'
 
@@ -58,6 +58,14 @@ export default function MasterCard({ account, listening, pnl, onToggle, onLogin,
           </button>
           <button className="btn small danger" disabled={!account.has_token_today} onClick={() => onExit(account)}>
             Exit all
+          </button>
+          <button
+            className="btn small"
+            disabled={account.active}
+            title={account.active ? 'Stop trading first to switch this account to a child' : 'Switch to child'}
+            onClick={() => onSwitchRole(account.id, 'child')}
+          >
+            Switch to child
           </button>
           <button className="btn small danger" onClick={() => onDelete(account)}>Remove</button>
         </div>

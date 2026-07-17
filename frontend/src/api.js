@@ -41,6 +41,7 @@ export const api = {
   createAccount: (data) => request('/accounts', { method: 'POST', body: JSON.stringify(data) }),
   deleteAccount: (id) => request(`/accounts/${id}`, { method: 'DELETE' }),
   toggleActive: (id) => request(`/accounts/${id}/toggle`, { method: 'PATCH' }),
+  switchRole: (id, role) => request(`/accounts/${id}/role`, { method: 'PATCH', body: JSON.stringify({ role }) }),
   setMultiplier: (id, multiplier_override) =>
     request(`/accounts/${id}/multiplier`, { method: 'PATCH', body: JSON.stringify({ multiplier_override }) }),
   autoLogin: (id) => request(`/accounts/${id}/auto-login`, { method: 'POST' }),
@@ -54,9 +55,7 @@ export const api = {
   getTicker: () => request('/ticker'),
   getStatus: () => request('/status'),
   getPnl: () => request('/pnl'),
-  wsUrl: () => {
-    const token = accessToken.get()
-    const url = BASE.replace('http', 'ws') + '/ws/live'
-    return token ? `${url}?token=${encodeURIComponent(token)}` : url
-  },
+  // Token is sent as the WebSocket's first message (see App.jsx), not a query param here -
+  // a query param would end up in uvicorn's plaintext access log on every connection.
+  wsUrl: () => BASE.replace('http', 'ws') + '/ws/live',
 }
