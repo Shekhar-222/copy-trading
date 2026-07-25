@@ -4,6 +4,7 @@ backend/*.db
 backend/*.log
 backend/backups/
 backend/.angel_scrip_master_cache.json
+backend/.groww_instrument_cache.csv
 backend/logs/
 node_modules/
 frontend/dist/

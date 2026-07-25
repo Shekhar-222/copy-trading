@@ -21,6 +21,9 @@ import kotak_client
 import angel_auth
 from angel_auth import AngelLoginError
 import angel_client
+import groww_auth
+from groww_auth import GrowwLoginError
+import groww_client
 from ticker_listener import start_master_listener, stop_master_listener, is_running
 from replication_engine import exit_account
 import trade_log
@@ -175,9 +178,9 @@ async def live_updates(ws: WebSocket):
 class AccountCreate(BaseModel):
     label: str
     role: str  # "master" or "child"
-    broker: str = "zerodha"  # "zerodha", "kotak_neo", or "angel_one"
-    client_id: str  # Kite client id, Kotak Neo UCC, or Angel One client code
-    api_key: str  # Kite api_key, Kotak Neo consumer_key, or Angel One SmartAPI api_key
+    broker: str = "zerodha"  # "zerodha", "kotak_neo", "angel_one", or "groww"
+    client_id: str  # Kite client id, Kotak Neo UCC, Angel One client code, or Groww UCC (optional/informational for Groww)
+    api_key: str  # Kite api_key, Kotak Neo consumer_key, Angel One SmartAPI api_key, or Groww API key
     api_secret: Optional[str] = None  # Kite api_secret (required for zerodha, unused otherwise)
     password: Optional[str] = None  # Zerodha login password - only used for zerodha auto-login
     totp_secret: str
@@ -203,6 +206,20 @@ class AccountOut(BaseModel):
         from_attributes = True
 
 
+class AccountUpdate(BaseModel):
+    """All fields optional - only what's sent gets changed, everything else is left as-is.
+    Broker and role aren't editable here (role has its own endpoint; broker isn't switchable at
+    all - see switch_role)."""
+    label: Optional[str] = None
+    client_id: Optional[str] = None
+    api_key: Optional[str] = None
+    api_secret: Optional[str] = None
+    password: Optional[str] = None
+    totp_secret: Optional[str] = None
+    mpin: Optional[str] = None
+    mobile_number: Optional[str] = None
+
+
 class ManualTokenIn(BaseModel):
     request_token: str
 
@@ -219,6 +236,12 @@ class RoleIn(BaseModel):
 def _token_is_fresh(acc: models.Account) -> bool:
     if not acc.token_generated_at or not acc.access_token_enc:
         return False
+    if acc.broker == "groww":
+        # Groww's TOTP-generated access token is documented as never expiring (see
+        # groww_auth.py) - once logged in, it stays "fresh" indefinitely instead of needing a
+        # same-day check the way Zerodha/Angel/Kotak all do, so this deliberately skips the
+        # date comparison below for this one broker.
+        return True
     return acc.token_generated_at.date() == datetime.datetime.utcnow().date()
 
 
@@ -243,8 +266,8 @@ def _to_out(acc: models.Account) -> dict:
 def create_account(payload: AccountCreate, db: Session = Depends(get_db)):
     if payload.role not in ("master", "child"):
         raise HTTPException(400, "role must be 'master' or 'child'")
-    if payload.broker not in ("zerodha", "kotak_neo", "angel_one"):
-        raise HTTPException(400, "broker must be 'zerodha', 'kotak_neo', or 'angel_one'")
+    if payload.broker not in ("zerodha", "kotak_neo", "angel_one", "groww"):
+        raise HTTPException(400, "broker must be 'zerodha', 'kotak_neo', 'angel_one', or 'groww'")
     if payload.broker == "kotak_neo":
         if payload.role != "child":
             raise HTTPException(400, "Kotak Neo accounts can only be added as child accounts for now.")
@@ -255,6 +278,11 @@ def create_account(payload: AccountCreate, db: Session = Depends(get_db)):
             raise HTTPException(400, "Angel One accounts can only be added as child accounts for now.")
         if not payload.mpin:
             raise HTTPException(400, "mpin (trading PIN) is required for Angel One accounts.")
+    elif payload.broker == "groww":
+        if payload.role != "child":
+            raise HTTPException(400, "Groww accounts can only be added as child accounts for now.")
+        if bool(payload.totp_secret) == bool(payload.api_secret):
+            raise HTTPException(400, "Provide exactly one of totp_secret or api_secret for Groww, matching the API key's type (TOTP or Approval).")
     else:
         if not payload.api_secret:
             raise HTTPException(400, "api_secret is required for Zerodha accounts.")
@@ -279,6 +307,62 @@ def create_account(payload: AccountCreate, db: Session = Depends(get_db)):
         multiplier_override=payload.multiplier_override,
     )
     db.add(acc)
+    db.commit()
+    db.refresh(acc)
+    return _to_out(acc)
+
+
+@app.patch("/accounts/{account_id}")
+def update_account(account_id: int, payload: AccountUpdate, db: Session = Depends(get_db)):
+    """Edits an existing account's label/credentials in place, so a typo'd or outdated
+    credential doesn't require deleting and re-adding the whole account. Any credential field
+    left blank in the request is left untouched. Changing any credential invalidates the stored
+    access token (forces a fresh login) - continuing to use a token generated under
+    now-discarded credentials would be silently wrong, not just stale."""
+    acc = db.query(models.Account).get(account_id)
+    if not acc:
+        raise HTTPException(404, "not found")
+    if acc.broker == "groww" and payload.totp_secret and payload.api_secret:
+        raise HTTPException(400, "Provide only one of totp_secret or api_secret for Groww, matching the API key's type - not both.")
+
+    credential_touched = False
+    if payload.label:
+        acc.label = payload.label
+    if payload.client_id:
+        acc.client_id = payload.client_id.strip()
+    if payload.api_key:
+        acc.api_key_enc = crypto_utils.encrypt(payload.api_key.strip())
+        credential_touched = True
+    if payload.api_secret:
+        acc.api_secret_enc = crypto_utils.encrypt(payload.api_secret.strip())
+        credential_touched = True
+        if acc.broker == "groww":
+            # Groww's two key types are mutually exclusive (see groww_auth.py) - setting one
+            # secret must clear the other, or a leftover from account creation makes
+            # get_access_token() reject both being present.
+            acc.totp_secret_enc = crypto_utils.encrypt("")
+    if payload.password:
+        acc.password_enc = crypto_utils.encrypt(payload.password)
+        credential_touched = True
+    if payload.totp_secret:
+        acc.totp_secret_enc = crypto_utils.encrypt(payload.totp_secret.strip())
+        credential_touched = True
+        if acc.broker == "groww":
+            acc.api_secret_enc = crypto_utils.encrypt("")
+    if payload.mpin:
+        acc.mpin_enc = crypto_utils.encrypt(payload.mpin.strip())
+        credential_touched = True
+    if payload.mobile_number:
+        acc.mobile_number = payload.mobile_number.strip()
+
+    if credential_touched:
+        acc.access_token_enc = None
+        acc.token_generated_at = None
+        if acc.role == "master":
+            # A live listener authenticated under the old credentials would otherwise keep
+            # running against now-discarded api_key/secret until it happens to reconnect.
+            stop_master_listener(acc.id)
+
     db.commit()
     db.refresh(acc)
     return _to_out(acc)
@@ -313,9 +397,9 @@ def set_multiplier(account_id: int, payload: MultiplierIn, db: Session = Depends
 
 @app.patch("/accounts/{account_id}/role")
 def switch_role(account_id: int, payload: RoleIn, db: Session = Depends(get_db)):
-    """Switches an existing account between master and child. Kotak Neo and Angel One accounts
-    can't become a master (the order-update feed that drives replication only exists for
-    Zerodha) and an account must be toggled off/excluded first, so a live listener or
+    """Switches an existing account between master and child. Kotak Neo, Angel One, and Groww
+    accounts can't become a master (the order-update feed that drives replication only exists
+    for Zerodha) and an account must be toggled off/excluded first, so a live listener or
     in-flight copying never gets yanked out from under it mid-switch."""
     acc = db.query(models.Account).get(account_id)
     if not acc:
@@ -326,8 +410,8 @@ def switch_role(account_id: int, payload: RoleIn, db: Session = Depends(get_db))
         return _to_out(acc)
     if acc.active:
         raise HTTPException(400, "Stop trading / exclude this account before switching its role.")
-    if payload.role == "master" and acc.broker in ("kotak_neo", "angel_one"):
-        raise HTTPException(400, "Kotak Neo and Angel One accounts can only be children - the master must be Zerodha.")
+    if payload.role == "master" and acc.broker in ("kotak_neo", "angel_one", "groww"):
+        raise HTTPException(400, "Kotak Neo, Angel One, and Groww accounts can only be children - the master must be Zerodha.")
 
     if acc.role == "master":
         stop_master_listener(acc.id)
@@ -357,8 +441,11 @@ def auto_login(account_id: int, db: Session = Depends(get_db)):
     """Zerodha: attempts fully automated login using stored password + TOTP secret, storing a
     daily access token. Angel One: logs in fresh with TOTP + PIN once and stores the resulting
     access/refresh token pair the same way (see angel_auth.py) - every other Angel One action
-    reuses those stored tokens rather than logging in again. Kotak Neo: logs in fresh with
-    TOTP + MPIN on every action instead (see kotak_auth.py), since its SDK has no equivalent
+    reuses those stored tokens rather than logging in again. Groww: logs in fresh with TOTP once
+    too, but unlike Angel the resulting token is documented as never expiring (see
+    groww_auth.py) - clicking this again later just regenerates a (still non-expiring) token,
+    it's never required daily the way Zerodha/Angel are. Kotak Neo: logs in fresh with TOTP +
+    MPIN on every action instead (see kotak_auth.py), since its SDK has no equivalent
     stored-token reattachment. All paths finish by refreshing capital and, for a Zerodha
     master, starting the order-update listener."""
     acc = db.query(models.Account).get(account_id)
@@ -413,6 +500,22 @@ def auto_login(account_id: int, db: Session = Depends(get_db)):
         _refresh_capital(acc, db)
         return _to_out(acc)
 
+    if acc.broker == "groww":
+        try:
+            access_token = groww_auth.get_access_token(
+                api_key=crypto_utils.decrypt(acc.api_key_enc),
+                totp_secret=crypto_utils.decrypt(acc.totp_secret_enc),
+                api_secret=crypto_utils.decrypt(acc.api_secret_enc) if acc.api_secret_enc else "",
+            )
+        except GrowwLoginError as e:
+            raise HTTPException(400, f"Groww login failed: {e}")
+
+        acc.access_token_enc = crypto_utils.encrypt(access_token)
+        acc.token_generated_at = datetime.datetime.utcnow()
+        db.commit()
+        _refresh_capital(acc, db)
+        return _to_out(acc)
+
     if not acc.password_enc:
         raise HTTPException(400, "No password stored for this account - use manual token login instead.")
 
@@ -447,12 +550,12 @@ def auto_login(account_id: int, db: Session = Depends(get_db)):
 def get_login_url(account_id: int, db: Session = Depends(get_db)):
     """Returns the URL you should open in a browser, log in manually, then copy the
     request_token from the redirected URL and POST it to /accounts/{id}/manual-token.
-    Zerodha only - Kotak Neo's and Angel One's TOTP+PIN logins have no manual/browser step,
-    use auto-login."""
+    Zerodha only - Kotak Neo's, Angel One's, and Groww's TOTP-based logins have no
+    manual/browser step, use auto-login."""
     acc = db.query(models.Account).get(account_id)
     if not acc:
         raise HTTPException(404, "not found")
-    if acc.broker in ("kotak_neo", "angel_one"):
+    if acc.broker in ("kotak_neo", "angel_one", "groww"):
         raise HTTPException(400, "This broker doesn't use a manual-token login flow - use auto-login instead.")
     api_key = crypto_utils.decrypt(acc.api_key_enc)
     return {"login_url": f"https://kite.zerodha.com/connect/login?api_key={api_key}&v=3"}
@@ -463,7 +566,7 @@ def manual_token(account_id: int, payload: ManualTokenIn, db: Session = Depends(
     acc = db.query(models.Account).get(account_id)
     if not acc:
         raise HTTPException(404, "not found")
-    if acc.broker in ("kotak_neo", "angel_one"):
+    if acc.broker in ("kotak_neo", "angel_one", "groww"):
         raise HTTPException(400, "This broker doesn't use a manual-token login flow - use auto-login instead.")
     try:
         access_token = generate_access_token(
@@ -516,6 +619,15 @@ def _refresh_capital(acc: models.Account, db: Session):
         db.commit()
         return
 
+    if acc.broker == "groww":
+        acc.capital = groww_client.get_margin(acc)
+        try:
+            acc.real_name = groww_client.get_profile_name(acc)
+        except Exception:
+            pass
+        db.commit()
+        return
+
     kite = get_kite_client(crypto_utils.decrypt(acc.api_key_enc), crypto_utils.decrypt(acc.access_token_enc))
     margins = kite.margins()
     # "net" (cash + collateral - utilised) reflects true usable capital, including pledged-stock
@@ -534,8 +646,8 @@ def _refresh_capital(acc: models.Account, db: Session):
 @app.post("/accounts/{account_id}/exit")
 def exit_positions(account_id: int, db: Session = Depends(get_db)):
     """Cancels every pending order and squares off every open position on this one account.
-    For Kotak Neo and Angel One accounts, only pending-order cancellation is automated for
-    now - see kotak_client.exit_account / angel_client.exit_account."""
+    For Kotak Neo, Angel One, and Groww accounts, only pending-order cancellation is automated
+    for now - see kotak_client.exit_account / angel_client.exit_account / groww_client.exit_account."""
     acc = db.query(models.Account).get(account_id)
     if not acc:
         raise HTTPException(404, "not found")
@@ -562,6 +674,8 @@ def get_positions(account_id: int, db: Session = Depends(get_db)):
             return kotak_client.get_positions(acc)
         if acc.broker == "angel_one":
             return angel_client.get_positions(acc)
+        if acc.broker == "groww":
+            return groww_client.get_positions(acc)
         kite = get_kite_client(crypto_utils.decrypt(acc.api_key_enc), crypto_utils.decrypt(acc.access_token_enc))
         positions = kite.positions().get("net", [])
         return [
@@ -618,10 +732,11 @@ def get_logs(limit: int = 100, db: Session = Depends(get_db)):
 
 @app.get("/pnl")
 def get_pnl(db: Session = Depends(get_db)):
-    """Live running P&L per account, pulled from open positions. Kotak Neo's figure is
-    best-effort (see kotak_client.get_pnl) since its positions API doesn't return a ready-made
-    PnL the way Kite's does; Angel One's (see angel_client.get_pnl) is summed from its own
-    documented "pnl" field."""
+    """Live running P&L per account, pulled from open positions. Kotak Neo's and Groww's
+    figures are best-effort (see kotak_client.get_pnl / groww_client.get_pnl) since neither
+    positions API returns a ready-made live-LTP PnL the way Kite's does - both sum realized
+    P&L only. Angel One's (see angel_client.get_pnl) is summed from its own documented "pnl"
+    field."""
     accounts = db.query(models.Account).all()
     out = []
     total = 0.0
@@ -633,6 +748,8 @@ def get_pnl(db: Session = Depends(get_db)):
                     pnl = kotak_client.get_pnl(acc)
                 elif acc.broker == "angel_one":
                     pnl = angel_client.get_pnl(acc)
+                elif acc.broker == "groww":
+                    pnl = groww_client.get_pnl(acc)
                 else:
                     kite = get_kite_client(crypto_utils.decrypt(acc.api_key_enc), crypto_utils.decrypt(acc.access_token_enc))
                     positions = kite.positions()

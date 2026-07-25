@@ -88,7 +88,11 @@ isn't verified from here, so these use the same protected-LIMIT-price workaround
 children (same 0.5% default, `MARKET_PROTECTION_PCT` in `backend/angel_client.py`) rather than
 risk placing an unprotected order.
 
-Product type mirrors the master order (defaults to MIS if unspecified) for all three brokers.
+**Groww children**: Groww's SDK documents `ORDER_TYPE_MARKET` as a first-class order type (unlike
+Kite, it doesn't reject a plain MARKET order), so these are placed as real MARKET orders with no
+protection workaround needed — unverified against a live account yet.
+
+Product type mirrors the master order (defaults to MIS if unspecified) for all four brokers.
 
 ## Security notes — please read
 
@@ -96,7 +100,7 @@ Product type mirrors the master order (defaults to MIS if unspecified) for all t
   `ENCRYPTION_KEY` in `.env`, but this app has no per-user accounts of its own — anyone who reaches
   the dashboard URL can trade on all connected accounts. For local-only use this is fine (only you
   can reach `localhost`). If you deploy it somewhere reachable off your machine, **set
-  `APP_ACCESS_TOKEN`** (see §9) first — without it, the API and WebSocket are wide open to anyone
+  `APP_ACCESS_TOKEN`** (see §10) first — without it, the API and WebSocket are wide open to anyone
   with the URL.
 - The automated login (`kite_auth.py`) drives Zerodha's *web login pages*, not an official Kite
   Connect endpoint — it's the same technique many open-source Kite tools use, but Zerodha can
@@ -184,7 +188,79 @@ remain to verify on first real trading use, and report back if they misbehave:
   orders, same caveat and same reason as Kotak Neo above; close Angel One positions manually until
   this is verified against a real account (`angel_client.exit_account`).
 
-## 8. Known limitations / things to check before relying on this live
+## 8. Groww child accounts
+
+Child accounts can also be Groww (the master must stay Zerodha, same as the other two brokers
+above). Add one from the dashboard by picking "Groww" as the broker; you'll need an API key
+generated at Groww's API Keys page. No PIN or password either way.
+
+Groww issues two mutually-exclusive API key types, chosen when you generate the key on their
+site, and a key only works with its matching flow — confirmed live (2026-07-24): using the wrong
+one gets rejected with `"Invalid type provided"`:
+- **TOTP key** — paired with a TOTP secret (base32), same shape as Kotak Neo/Angel One. Fully
+  unattended: the 6-digit code is computed locally on every login, nothing to approve anywhere.
+  Fill in the "TOTP secret" field, leave "API secret" blank. **Use this one if you want daily
+  Auto-login to work without touching the Groww app.**
+- **Approval key** — paired with a plain API secret string, used to compute a SHA-256 checksum
+  of itself + the current timestamp (no TOTP involved). ~~Originally assumed to be just as
+  unattended as TOTP~~ — **corrected, confirmed live (2026-07-25): it isn't.** A real account hit
+  `Groww API Error 403: Session approval required before generating token` on this flow. Groww's
+  server requires an explicit approval step inside the Groww app before an Approval-key session
+  can mint a token — the SDK has no method for this (checked: nothing approve-session-shaped
+  exists), so it's a manual, one-off step in the app, not something this integration can automate.
+  This defeats unattended daily Auto-login for this key type — prefer a TOTP key instead unless
+  you're fine occasionally approving a session by hand. Fill in the "API secret" field, leave
+  "TOTP secret" blank.
+
+The add-account form enforces exactly one of the two being filled (`groww_auth.get_access_token`
+takes `totp_secret` or `api_secret`, never both/neither).
+
+Install the SDK into the backend venv (on PyPI):
+```bash
+pip install growwapi==1.5.0
+```
+
+Unlike every other broker here, Groww's TOTP-based access token (`get_access_token(api_key,
+totp=...)`) is documented as having **"No Expiry"** — it's generated once (on "Auto-login") and
+reused indefinitely, rather than needing a daily refresh the way Zerodha/Angel do (`groww_auth.py`,
+and `main.py`'s `_token_is_fresh` has a broker-specific carve-out for this so it doesn't force a
+same-day re-login).
+
+This integration is grounded in Groww's public SDK docs **and** a real downloaded copy of Groww's
+instrument list (`https://growwapi-assets.groww.in/instruments/instrument.csv`, ~21MB), inspected
+directly to confirm exact field formats before writing the F&O contract matcher — specifically to
+avoid a repeat of the Angel One integration's worst bug (comparing strike prices as
+differently-formatted strings, which silently broke every F&O order there). Still, a few things
+remain to verify on first real trading use, and report back if they misbehave:
+- **Confirmed against the installed package's source, not just docs**: the SDK's exception base
+  class is `growwapi.groww.exceptions.BaseGrowwException`, not `GrowwBaseException` as one doc
+  page states — `groww_auth.py` uses the correct name, but it's worth knowing the public docs have
+  at least one inaccuracy like this.
+- **The SDK itself has a live-confirmed bug**: `GrowwAPI.get_access_token()` reads
+  `error.displayMessage` from a 400 response body, but Groww's real API returns the message under
+  `error.errorMessage` instead — every 400 (wrong key type, bad TOTP, etc.) gets swallowed into a
+  useless generic `"Bad Request"`. `groww_auth.get_access_token()` re-implements this one call
+  directly instead of calling the SDK method, reading the real field so login errors stay
+  diagnosable. This bug is specific to the SDK's `get_access_token`; other SDK calls (order
+  placement, etc.) still go through the real SDK and haven't been checked for the same issue.
+- `growwapi`'s own dependencies (`pandas`, `protobuf`, `aiohttp`, etc.) were all properly declared
+  on install — unlike Angel One's SDK, which silently needed an extra `logzero` install. Nothing
+  extra should be needed here, but re-check on a fresh install if imports fail.
+- Order placement uses a real `ORDER_TYPE_MARKET` order (see §5) with a short-delay follow-up
+  status check before declaring success (`groww_client._raise_if_rejected`) — the same defensive
+  pattern added to `angel_client.py` after a real insufficient-funds rejection there was logged as
+  SUCCESS. Whether Groww's `place_order()` response can itself be trusted as final, or genuinely
+  needs that follow-up check, is unverified live.
+- Margin (`get_available_margin_details()['clear_cash']`), profile name (`get_user_profile()`,
+  falls back to the `ucc` field since no display-name field is documented), and position/PnL field
+  names (`get_positions_for_user()`) are implemented against documented fields but unverified live.
+- **The "Exit all" button does not auto-square-off Groww positions** — it only cancels pending
+  orders, same caveat and reason as Kotak Neo/Angel One above; close Groww positions manually
+  until this is verified against a real account (`groww_client.exit_account`).
+- Groww's PnL figure is best-effort (`realised_pnl` only, no live-LTP unrealized leg) — treat it
+  as approximate (`groww_client.get_pnl`), same caveat as Kotak Neo's.
+
+## 9. Known limitations / things to check before relying on this live
 
 - Only `COMPLETE` master orders are copied; partial fills, modifications, and cancellations on the
   master are not currently propagated to children — worth adding if your master strategy relies on
@@ -194,14 +270,14 @@ remain to verify on first real trading use, and report back if they misbehave:
 - Test everything in small size / paper first. This places real orders with real money the
   moment the master's order completes.
 
-## 9. Deploying so you can access it from any machine
+## 10. Deploying so you can access it from any machine
 
 The backend is a long-running process — it holds a persistent WebSocket to the market during
 trading hours and keeps a SQLite file that must survive restarts — so it needs an always-on host
 with a persistent disk, not a serverless/sleep-on-idle free tier. This section deploys the
 **backend on Railway** and the **frontend (static) on Vercel**.
 
-### 9.1 Push to GitHub
+### 10.1 Push to GitHub
 
 ```bash
 git add -A
@@ -209,7 +285,7 @@ git commit -m "Deploy: add access gate, Dockerfile, Railway/Vercel config"
 git push
 ```
 
-### 9.2 Backend → Railway
+### 10.2 Backend → Railway
 
 1. On [railway.app](https://railway.app), **New Project → Deploy from GitHub repo**, pick this repo.
 2. In the service's **Settings → Source**, set **Root Directory** to `backend`. Railway will detect
@@ -222,16 +298,16 @@ git push
    - `DATABASE_URL` = `sqlite:////data/copytrader.db` (note **4 slashes** — that's the volume path)
    - `APP_ACCESS_TOKEN` — generate with `python -c "import secrets; print(secrets.token_urlsafe(24))"`.
      This is the password the dashboard will ask for once deployed — see the security note below.
-   - `FRONTEND_ORIGIN` — leave as `http://localhost:5173` for now, you'll update it after step 9.3
+   - `FRONTEND_ORIGIN` — leave as `http://localhost:5173` for now, you'll update it after step 10.3
      once you have your Vercel URL.
 5. **Settings → Networking → Generate Domain** to get a public URL
    (e.g. `https://copy-trading-production.up.railway.app`). Every `git push` redeploys automatically.
 
-### 9.3 Frontend → Vercel
+### 10.3 Frontend → Vercel
 
 1. On [vercel.com](https://vercel.com), **Add New → Project**, import the same GitHub repo.
 2. Set **Root Directory** to `frontend` (Vercel auto-detects the Vite build command/output).
-3. **Environment Variables**, add `VITE_API_BASE` = your Railway URL from step 9.2 (no trailing slash).
+3. **Environment Variables**, add `VITE_API_BASE` = your Railway URL from step 10.2 (no trailing slash).
 4. Deploy. You'll get a URL like `https://your-app.vercel.app`.
 5. Back on Railway, update `FRONTEND_ORIGIN` to that Vercel URL (comma-separate if you still want
    local dev to work too: `http://localhost:5173,https://your-app.vercel.app`) — Railway redeploys
@@ -243,7 +319,7 @@ once per browser before the dashboard loads.
 ### Security note on deploying this publicly
 
 This app places real orders and squares off real positions with **no per-user accounts** — it's
-built for a single operator. `APP_ACCESS_TOKEN` (§9.2) is a single shared-secret gate on the whole
+built for a single operator. `APP_ACCESS_TOKEN` (§10.2) is a single shared-secret gate on the whole
 API and dashboard, checked on every request and on the WebSocket handshake; treat it like a
 password (a long random string, not shared, rotate it if you suspect it leaked — just change the
 Railway variable). It is **not** a substitute for keeping the URL itself private: don't post it
@@ -272,9 +348,11 @@ backend/
   kotak_client.py                  # Kotak Neo order placement, symbol mapping, capital, exit
   angel_auth.py                      # Angel One TOTP+PIN login
   angel_client.py                      # Angel One order placement, symbol mapping, capital, exit
-  replication_engine.py                  # Proportional sizing, freeze-limit slicing, order placement
-  ticker_listener.py                       # KiteTicker order-update listener (master, Zerodha only)
-  Dockerfile, railway.toml                   # Backend deploy config (see §9)
+  groww_auth.py                          # Groww TOTP login (non-expiring token)
+  groww_client.py                          # Groww order placement, symbol mapping, capital, exit
+  replication_engine.py                      # Proportional sizing, freeze-limit slicing, order placement
+  ticker_listener.py                           # KiteTicker order-update listener (master, Zerodha only)
+  Dockerfile, railway.toml                       # Backend deploy config (see §10)
 frontend/
   src/App.jsx              # Dashboard shell, live feed via WebSocket
   src/components/           # MasterCard, ChildCard, TradeFeed, TickerTape, AccessGate, modals

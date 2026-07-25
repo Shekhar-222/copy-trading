@@ -8,6 +8,7 @@ replicate_order's docstring for why).
 import pytest
 from sqlalchemy import create_engine
 from sqlalchemy.orm import sessionmaker
+from sqlalchemy.pool import StaticPool
 
 import crypto_utils
 import models
@@ -15,10 +16,19 @@ import replication_engine
 
 
 @pytest.fixture
-def db_session():
-    engine = create_engine("sqlite:///:memory:", connect_args={"check_same_thread": False})
+def db_session(monkeypatch):
+    # StaticPool so every connection (including the ones _replicate_one_child's worker threads
+    # open via replication_engine.SessionLocal) shares the same in-memory database instead of
+    # each thread getting its own empty :memory: db. replication_engine.SessionLocal is
+    # monkeypatched to this test's sessionmaker for the same reason - otherwise those worker
+    # threads would fall back to the real database.py engine (the actual copytrader.db file).
+    engine = create_engine(
+        "sqlite:///:memory:", connect_args={"check_same_thread": False}, poolclass=StaticPool,
+    )
     models.Base.metadata.create_all(bind=engine)
-    session = sessionmaker(bind=engine)()
+    TestSessionLocal = sessionmaker(bind=engine)
+    monkeypatch.setattr(replication_engine, "SessionLocal", TestSessionLocal)
+    session = TestSessionLocal()
     yield session
     session.close()
 
@@ -248,6 +258,19 @@ def test_angel_one_child_is_skipped_with_an_explicit_message(db_session, fake_ki
     assert len(logs) == 1
     assert logs[0].status == "SKIPPED"
     assert "Angel One" in logs[0].message
+    assert db_session.query(models.MirroredOrder).count() == 0
+
+
+def test_groww_child_is_skipped_with_an_explicit_message(db_session, fake_kites):
+    master = make_account(db_session, "master", "master")
+    make_account(db_session, "growwchild", "child", broker="groww")
+
+    replication_engine.replicate_order(db_session, master, sl_order())
+
+    logs = db_session.query(models.TradeLog).all()
+    assert len(logs) == 1
+    assert logs[0].status == "SKIPPED"
+    assert "Groww" in logs[0].message
     assert db_session.query(models.MirroredOrder).count() == 0
 
 

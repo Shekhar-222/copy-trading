@@ -3,11 +3,12 @@ Core copy-trading logic.
 
 When the master account places/completes an order, this module works out the
 proportional quantity for each active child account (based on capital ratio)
-and places a matching order on that child's Kite (Zerodha), Kotak Neo, or Angel
-One account - the master is always Zerodha (that's where the order-update feed
-comes from), but children can be any of the three. See kotak_client.py / angel_client.py
-for the Kotak Neo / Angel One sides.
+and places a matching order on that child's Kite (Zerodha), Kotak Neo, Angel
+One, or Groww account - the master is always Zerodha (that's where the order-update feed
+comes from), but children can be any of the four. See kotak_client.py / angel_client.py /
+groww_client.py for the non-Zerodha sides.
 """
+import concurrent.futures
 import math
 import datetime
 from sqlalchemy.orm import Session
@@ -16,8 +17,24 @@ import models
 import crypto_utils
 import kotak_client
 import angel_client
+import groww_client
+from database import SessionLocal
 from kite_auth import get_kite_client
 from trade_log import log_trade_event
+
+# One master order can fan out to several children - each placed in its own thread (see
+# _replicate_one_child) so a slow one (Kotak Neo's full re-login every action, Angel
+# One's/Groww's post-placement rejection-check sleep) no longer holds up every other child's
+# log entry behind it in a sequential loop. Confirmed live (2026-07-24): with children processed
+# one at a time, the dashboard's "Live replication feed" showed logs trailing several seconds
+# behind the master's actual fill, worst for whichever child happened to be last in the loop.
+_CHILD_REPLICATION_WORKERS = 8
+
+_NON_ZERODHA_PLACERS = {
+    "kotak_neo": (kotak_client.place_child_order, "Order placed on Kotak Neo (market protection)"),
+    "angel_one": (angel_client.place_child_order, "Order placed on Angel One (market protection)"),
+    "groww": (groww_client.place_child_order, "Order placed on Groww (MARKET)"),
+}
 
 
 def compute_child_quantity(master_qty: int, master_capital: float, child_capital: float,
@@ -151,10 +168,96 @@ def replicate_order(db: Session, master_account: models.Account, order: dict, br
     _replicate_fill(db, master_account, order, broadcast)
 
 
+def _replicate_one_child(child_id: int, exchange: str, tradingsymbol: str, transaction_type: str,
+                          slices: list, product: str, instrument, note: str, master_order_id,
+                          broadcast=None) -> None:
+    """Places every freeze-limit slice for ONE child and logs the result. Runs in its own
+    worker thread with its own DB session - SQLAlchemy sessions aren't safe to share across
+    threads, so this re-fetches the child by id rather than being passed the ORM object loaded
+    on the caller's session. See _replicate_fill for why this is concurrent at all."""
+    db = SessionLocal()
+    try:
+        child = db.query(models.Account).get(child_id)
+        if child is None:
+            return
+
+        placer = _NON_ZERODHA_PLACERS.get(child.broker)
+        if placer:
+            place_fn, label = placer
+            for slice_qty in slices:
+                try:
+                    child_order_id = place_fn(
+                        child, exchange, tradingsymbol, transaction_type, slice_qty, product, instrument,
+                    )
+                    log_trade_event(
+                        db, child, exchange, tradingsymbol, transaction_type, slice_qty, "SUCCESS",
+                        f"{label}{note}.",
+                        broadcast, master_order_id=master_order_id, child_order_id=str(child_order_id),
+                    )
+                except Exception as e:  # noqa: BLE001 - log and move on to the next slice
+                    log_trade_event(
+                        db, child, exchange, tradingsymbol, transaction_type, slice_qty, "FAILED",
+                        str(e), broadcast, master_order_id=master_order_id,
+                    )
+            return
+
+        try:
+            kite = get_kite_client(
+                api_key=crypto_utils.decrypt(child.api_key_enc),
+                access_token=crypto_utils.decrypt(child.access_token_enc),
+            )
+        except Exception as e:  # noqa: BLE001
+            log_trade_event(
+                db, child, exchange, tradingsymbol, transaction_type, sum(slices), "FAILED",
+                str(e), broadcast, master_order_id=master_order_id,
+            )
+            return
+
+        try:
+            # One LTP fetch per child, shared across slices - the slices go out back-to-back
+            # within the same moment, and Kite rate-limits quote calls.
+            limit_price = _protected_limit_price(kite, exchange, tradingsymbol, transaction_type)
+        except Exception as e:  # noqa: BLE001
+            log_trade_event(
+                db, child, exchange, tradingsymbol, transaction_type, sum(slices), "FAILED",
+                str(e), broadcast, master_order_id=master_order_id,
+            )
+            return
+
+        for slice_qty in slices:
+            try:
+                child_order_id = kite.place_order(
+                    variety=kite.VARIETY_REGULAR,
+                    exchange=exchange,
+                    tradingsymbol=tradingsymbol,
+                    transaction_type=transaction_type,
+                    quantity=slice_qty,
+                    order_type=kite.ORDER_TYPE_LIMIT,
+                    price=limit_price,
+                    product=product,
+                )
+                log_trade_event(
+                    db, child, exchange, tradingsymbol, transaction_type, slice_qty, "SUCCESS",
+                    f"Order placed as LIMIT @ {limit_price} (market protection){note}.",
+                    broadcast, master_order_id=master_order_id, child_order_id=str(child_order_id),
+                )
+            except Exception as e:  # noqa: BLE001 - we want to log any Kite/network error and continue to next slice
+                log_trade_event(
+                    db, child, exchange, tradingsymbol, transaction_type, slice_qty, "FAILED",
+                    str(e), broadcast, master_order_id=master_order_id,
+                )
+    finally:
+        db.close()
+
+
 def _replicate_fill(db: Session, master_account: models.Account, order: dict, broadcast=None):
     """The original fill-then-copy path: places an immediate market-protected order on each
     child. Used for completed regular (LIMIT/MARKET) orders, and as a fallback if a stoploss
-    order completes without ever having been mirrored (see _handle_stoploss_update)."""
+    order completes without ever having been mirrored (see _handle_stoploss_update).
+
+    Quantity/slicing is computed here (fast, no network), then each child's actual placement
+    runs concurrently in _replicate_one_child - see that function's docstring and the
+    _CHILD_REPLICATION_WORKERS comment above for why."""
     children = (
         db.query(models.Account)
         .filter(models.Account.role == "child", models.Account.active == True)  # noqa: E712
@@ -172,110 +275,35 @@ def _replicate_fill(db: Session, master_account: models.Account, order: dict, br
     instrument = _get_instrument_detail(master_kite, exchange, tradingsymbol)
     lot_size = order.get("lot_size") or (instrument or {}).get("lot_size") or _guess_lot_size(tradingsymbol)
     freeze_qty = _freeze_quantity(exchange, tradingsymbol)
+    product = order.get("product", "MIS")
+    master_order_id = order.get("order_id")
 
-    for child in children:
-        qty = compute_child_quantity(
-            master_qty=order["quantity"],
-            master_capital=master_capital,
-            child_capital=child.capital or 0.0,
-            lot_size=lot_size,
-            multiplier_override=child.multiplier_override,
-        )
-
-        if qty <= 0:
-            log_trade_event(
-                db, child, exchange, tradingsymbol, transaction_type, qty, "SKIPPED",
-                "Computed replicated quantity was 0 (child capital too small for one lot).",
-                broadcast, master_order_id=order.get("order_id"),
+    with concurrent.futures.ThreadPoolExecutor(max_workers=_CHILD_REPLICATION_WORKERS) as pool:
+        futures = []
+        for child in children:
+            qty = compute_child_quantity(
+                master_qty=order["quantity"],
+                master_capital=master_capital,
+                child_capital=child.capital or 0.0,
+                lot_size=lot_size,
+                multiplier_override=child.multiplier_override,
             )
-            continue
 
-        slices = _slice_quantity(qty, lot_size, freeze_qty)
-        note = f" (sliced into {len(slices)} orders to stay within the exchange freeze limit)" if len(slices) > 1 else ""
-
-        if child.broker == "kotak_neo":
-            for slice_qty in slices:
-                try:
-                    child_order_id = kotak_client.place_child_order(
-                        child, exchange, tradingsymbol, transaction_type, slice_qty,
-                        order.get("product", "MIS"), instrument,
-                    )
-                    log_trade_event(
-                        db, child, exchange, tradingsymbol, transaction_type, slice_qty, "SUCCESS",
-                        f"Order placed on Kotak Neo (market protection){note}.",
-                        broadcast, master_order_id=order.get("order_id"), child_order_id=str(child_order_id),
-                    )
-                except Exception as e:  # noqa: BLE001 - log and move on to the next slice/child
-                    log_trade_event(
-                        db, child, exchange, tradingsymbol, transaction_type, slice_qty, "FAILED",
-                        str(e), broadcast, master_order_id=order.get("order_id"),
-                    )
-            continue
-
-        if child.broker == "angel_one":
-            for slice_qty in slices:
-                try:
-                    child_order_id = angel_client.place_child_order(
-                        child, exchange, tradingsymbol, transaction_type, slice_qty,
-                        order.get("product", "MIS"), instrument,
-                    )
-                    log_trade_event(
-                        db, child, exchange, tradingsymbol, transaction_type, slice_qty, "SUCCESS",
-                        f"Order placed on Angel One (market protection){note}.",
-                        broadcast, master_order_id=order.get("order_id"), child_order_id=str(child_order_id),
-                    )
-                except Exception as e:  # noqa: BLE001 - log and move on to the next slice/child
-                    log_trade_event(
-                        db, child, exchange, tradingsymbol, transaction_type, slice_qty, "FAILED",
-                        str(e), broadcast, master_order_id=order.get("order_id"),
-                    )
-            continue
-
-        try:
-            kite = get_kite_client(
-                api_key=crypto_utils.decrypt(child.api_key_enc),
-                access_token=crypto_utils.decrypt(child.access_token_enc),
-            )
-        except Exception as e:  # noqa: BLE001
-            log_trade_event(
-                db, child, exchange, tradingsymbol, transaction_type, qty, "FAILED",
-                str(e), broadcast, master_order_id=order.get("order_id"),
-            )
-            continue
-
-        try:
-            # One LTP fetch per child, shared across slices - the slices go out back-to-back
-            # within the same moment, and Kite rate-limits quote calls.
-            limit_price = _protected_limit_price(kite, exchange, tradingsymbol, transaction_type)
-        except Exception as e:  # noqa: BLE001
-            log_trade_event(
-                db, child, exchange, tradingsymbol, transaction_type, qty, "FAILED",
-                str(e), broadcast, master_order_id=order.get("order_id"),
-            )
-            continue
-
-        for slice_qty in slices:
-            try:
-                child_order_id = kite.place_order(
-                    variety=kite.VARIETY_REGULAR,
-                    exchange=exchange,
-                    tradingsymbol=tradingsymbol,
-                    transaction_type=transaction_type,
-                    quantity=slice_qty,
-                    order_type=kite.ORDER_TYPE_LIMIT,
-                    price=limit_price,
-                    product=order.get("product", kite.PRODUCT_MIS),
-                )
+            if qty <= 0:
                 log_trade_event(
-                    db, child, exchange, tradingsymbol, transaction_type, slice_qty, "SUCCESS",
-                    f"Order placed as LIMIT @ {limit_price} (market protection){note}.",
-                    broadcast, master_order_id=order.get("order_id"), child_order_id=str(child_order_id),
+                    db, child, exchange, tradingsymbol, transaction_type, qty, "SKIPPED",
+                    "Computed replicated quantity was 0 (child capital too small for one lot).",
+                    broadcast, master_order_id=master_order_id,
                 )
-            except Exception as e:  # noqa: BLE001 - we want to log any Kite/network error and continue to next slice
-                log_trade_event(
-                    db, child, exchange, tradingsymbol, transaction_type, slice_qty, "FAILED",
-                    str(e), broadcast, master_order_id=order.get("order_id"),
-                )
+                continue
+
+            slices = _slice_quantity(qty, lot_size, freeze_qty)
+            note = f" (sliced into {len(slices)} orders to stay within the exchange freeze limit)" if len(slices) > 1 else ""
+            futures.append(pool.submit(
+                _replicate_one_child, child.id, exchange, tradingsymbol, transaction_type,
+                slices, product, instrument, note, master_order_id, broadcast,
+            ))
+        concurrent.futures.wait(futures)
 
 
 _RESTING_STATUSES = {"OPEN", "TRIGGER PENDING", "AMO REQ RECEIVED"}
@@ -386,9 +414,9 @@ def _handle_order_lifecycle(db: Session, master_account: models.Account, order: 
     resting on the master's book, instead of waiting for it to fill like the old fill-then-copy
     model (_replicate_fill) - so a child's own order book actually reflects the master's: a
     stoploss's protection or an AMO order's overnight queue position exists on the child too,
-    not just after the master's already acted on it. Kotak Neo and Angel One children are
-    skipped for now (see kotak_client.py / angel_client.py headers) - their place_child_order
-    only knows how to submit an immediate market-protected order.
+    not just after the master's already acted on it. Kotak Neo, Angel One, and Groww children
+    are skipped for now (see kotak_client.py / angel_client.py / groww_client.py headers) -
+    their place_child_order only knows how to submit an immediate market(-protected) order.
     """
     master_order_id = order.get("order_id")
     status = order.get("status")
@@ -550,8 +578,8 @@ def _handle_order_lifecycle(db: Session, master_account: models.Account, order: 
             )
             continue
 
-        if child.broker in ("kotak_neo", "angel_one"):
-            broker_label = "Kotak Neo" if child.broker == "kotak_neo" else "Angel One"
+        if child.broker in ("kotak_neo", "angel_one", "groww"):
+            broker_label = {"kotak_neo": "Kotak Neo", "angel_one": "Angel One", "groww": "Groww"}[child.broker]
             log_trade_event(
                 db, child, exchange, tradingsymbol, transaction_type, qty, "SKIPPED",
                 f"Live order mirroring isn't supported for {broker_label} children yet - this order "
@@ -578,14 +606,16 @@ def exit_account(db: Session, account: models.Account, broadcast=None) -> list:
     places an opposite protected LIMIT order against every open net position. Independent of
     the master/child replication flow - works the same for a master or a child account.
 
-    Kotak Neo and Angel One accounts are delegated to kotak_client.exit_account /
-    angel_client.exit_account, which only cancel pending orders and do not auto-square-off
-    positions - see those functions' docstrings for why.
+    Kotak Neo, Angel One, and Groww accounts are delegated to kotak_client.exit_account /
+    angel_client.exit_account / groww_client.exit_account, which only cancel pending orders
+    and do not auto-square-off positions - see those functions' docstrings for why.
     """
     if account.broker == "kotak_neo":
         return kotak_client.exit_account(db, account, broadcast=broadcast)
     if account.broker == "angel_one":
         return angel_client.exit_account(db, account, broadcast=broadcast)
+    if account.broker == "groww":
+        return groww_client.exit_account(db, account, broadcast=broadcast)
 
     kite = get_kite_client(
         api_key=crypto_utils.decrypt(account.api_key_enc),

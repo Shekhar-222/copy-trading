@@ -29,3 +29,9 @@ smartapi-python==1.5.5
 # dependency (confirmed on install: `from SmartApi import SmartConnect` raises
 # ModuleNotFoundError: No module named 'logzero' without this line).
 logzero==1.7.0
+
+# Groww broker support - on PyPI, all dependencies (pandas, protobuf, aiohttp, etc.) properly
+# declared this time (confirmed on install - no undeclared-dependency gap like logzero above).
+# NOTE: exceptions live in growwapi.groww.exceptions.BaseGrowwException (not "GrowwBaseException"
+# as one doc page states - confirmed against the installed package's actual source).
+growwapi==1.5.0

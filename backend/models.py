@@ -9,32 +9,39 @@ class Account(Base):
     id = Column(Integer, primary_key=True, index=True)
     label = Column(String, nullable=False)              # human-friendly name, e.g. "Shekhar Main"
     role = Column(String, nullable=False)                # "master" or "child"
-    broker = Column(String, nullable=False, default="zerodha")  # "zerodha", "kotak_neo", or "angel_one"
+    broker = Column(String, nullable=False, default="zerodha")  # "zerodha", "kotak_neo", "angel_one", or "groww"
 
-    # Fields below are reused across brokers where the concept lines up, to avoid a column
-    # per broker. Kotak Neo and Angel One are both child-only (see kotak_client.py /
-    # angel_client.py) and have no master/order-update feed and no password-based login -
-    # only TOTP + a static PIN. Kotak Neo has no daily-refreshable token (its SDK has no
-    # documented way to reattach a session from a stored token alone, so every action
-    # re-authenticates fresh); Angel One DOES support this (generateSession() returns a real,
-    # reusable JWT access/refresh token pair), so it follows Zerodha's daily-token model
-    # instead - see angel_auth.py's module docstring for why that distinction matters (a
-    # fresh-login-per-action design for Angel One hit its login endpoint's rate limit).
-    #   client_id       - Zerodha client id, e.g. AJ230321  /  Kotak Neo UCC          /  Angel One client code
-    #   api_key_enc      - Kite Connect api_key              /  Kotak Neo consumer_key /  Angel One SmartAPI api_key
-    #   api_secret_enc    - Kite Connect api_secret            /  unused for Kotak Neo  /  Angel One refresh token
-    #                                                             (stored as "")             (from generateSession,
-    #                                                                                          reused to rebuild a
-    #                                                                                          client without a
-    #                                                                                          fresh login - see
-    #                                                                                          angel_auth.get_angel_client)
-    #   totp_secret_enc  - TOTP secret, same concept across all three brokers (only used at daily-login time
-    #                                                                          for Angel One, every action for Kotak Neo)
-    #   password_enc     - Zerodha login password (optional)  /  unused for Kotak Neo and Angel One
-    #   access_token_enc  - Kite's daily access token          /  sentinel marking "logged in       /  Angel One's real
-    #                                                             today" for Kotak Neo (re-               daily JWT access
-    #                                                             authenticates fresh every action,       token, reused
-    #                                                             see kotak_auth.py)                       across actions
+    # Fields below are reused across brokers where the concept lines up, to avoid a column per
+    # broker. Kotak Neo, Angel One, and Groww are all child-only (see kotak_client.py /
+    # angel_client.py / groww_client.py) and have no master/order-update feed and no
+    # password-based login - only TOTP (+ a static PIN for Kotak/Angel). Each has a different
+    # token-lifecycle model though, which changes what access_token_enc/api_secret_enc actually
+    # hold:
+    #   - Kotak Neo: no stored-token reattachment support at all - every action re-authenticates
+    #     fresh with TOTP+MPIN (kotak_auth.py). access_token_enc just holds a "logged in today"
+    #     sentinel string.
+    #   - Angel One: generateSession() returns a real, reusable JWT access/refresh token pair,
+    #     refreshed once daily like Zerodha (angel_auth.py) - a fresh-login-per-action design
+    #     (copying Kotak's pattern initially) hit Angel's login rate limit on first live use.
+    #     access_token_enc holds the real access token, api_secret_enc (otherwise unused for
+    #     this broker) holds the refresh token.
+    #   - Groww: get_access_token() is documented as producing a token with "No Expiry" -
+    #     generated ONCE (not daily) and reused indefinitely (groww_auth.py). access_token_enc
+    #     holds that token; _token_is_fresh() has a broker-specific carve-out for "groww" so it
+    #     doesn't force a same-day re-login the way Zerodha/Angel do. Groww also issues two
+    #     mutually-exclusive API key types chosen at key-creation time on their site (confirmed
+    #     live, 2026-07-24: using the wrong flow for a given key returns "Invalid type
+    #     provided") - a "TOTP" key pairs with totp_secret_enc same as the other brokers, an
+    #     "Approval" key pairs with a plain secret string in api_secret_enc instead (used to
+    #     compute a checksum, no TOTP/app-approval step involved despite the name). Exactly one
+    #     of totp_secret_enc/api_secret_enc is populated for a Groww account; see groww_auth.py.
+    #
+    #   client_id       - Zerodha client id (e.g. AJ230321) / Kotak Neo UCC / Angel One client code / Groww UCC (optional, informational only - not used for Groww auth)
+    #   api_key_enc      - Kite Connect api_key / Kotak Neo consumer_key / Angel One SmartAPI api_key / Groww API key
+    #   api_secret_enc    - Kite Connect api_secret / unused for Kotak Neo (stored as "") / Angel One's refresh token / Groww's Approval-key secret (empty if the account uses a TOTP-key instead)
+    #   totp_secret_enc  - TOTP secret, same concept across Zerodha/Kotak Neo/Angel One (Zerodha's is only used for auto-login, not required); for Groww, populated only if the account uses a TOTP-key (empty if it uses an Approval-key instead - see api_secret_enc)
+    #   password_enc     - Zerodha login password (optional) / unused for Kotak Neo, Angel One, and Groww
+    #   access_token_enc  - Kite's daily access token / Kotak Neo's "logged in today" sentinel / Angel One's daily JWT / Groww's non-expiring token
     client_id = Column(String, nullable=False)
     api_key_enc = Column(Text, nullable=False)
     api_secret_enc = Column(Text, nullable=False)

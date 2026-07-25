@@ -5,6 +5,7 @@ import ChildCard from './components/ChildCard'
 import PnlBadge from './components/PnlBadge'
 import TradeFeed from './components/TradeFeed'
 import AddAccountModal from './components/AddAccountModal'
+import EditAccountModal from './components/EditAccountModal'
 import TokenModal from './components/TokenModal'
 import ConfirmModal from './components/ConfirmModal'
 import PositionsModal from './components/PositionsModal'
@@ -16,6 +17,7 @@ export default function App() {
   const [status, setStatus] = useState({ masters: [] })
   const [pnl, setPnl] = useState({ accounts: [], total: 0 })
   const [showAdd, setShowAdd] = useState(false)
+  const [editTarget, setEditTarget] = useState(null)
   const [tokenModalAccount, setTokenModalAccount] = useState(null)
   const [deleteTarget, setDeleteTarget] = useState(null)
   const [exitTarget, setExitTarget] = useState(null)
@@ -73,6 +75,10 @@ export default function App() {
     await api.createAccount(data)
     await load()
   }
+  const handleEditSave = async (id, data) => {
+    await api.updateAccount(id, data)
+    await load()
+  }
   const handleDelete = async (id) => { await api.deleteAccount(id); await load() }
   const handleToggle = async (id) => { await api.toggleActive(id); await load() }
   const handleSwitchRole = async (id, role) => {
@@ -125,6 +131,7 @@ export default function App() {
             onToggle={handleToggle}
             onLogin={handleAutoLogin}
             onManualLogin={setTokenModalAccount}
+            onEdit={setEditTarget}
             onDelete={setDeleteTarget}
             onExit={setExitTarget}
             onShowPositions={setPositionsTarget}
@@ -149,6 +156,7 @@ export default function App() {
                 onToggle={handleToggle}
                 onLogin={handleAutoLogin}
                 onManualLogin={setTokenModalAccount}
+                onEdit={setEditTarget}
                 onDelete={setDeleteTarget}
                 onSetMultiplier={handleSetMultiplier}
                 onExit={setExitTarget}
@@ -168,6 +176,9 @@ export default function App() {
       </div>
 
       {showAdd && <AddAccountModal onClose={() => setShowAdd(false)} onCreate={handleCreate} />}
+      {editTarget && (
+        <EditAccountModal account={editTarget} onClose={() => setEditTarget(null)} onSave={handleEditSave} />
+      )}
       {tokenModalAccount && (
         <TokenModal account={tokenModalAccount} onClose={() => setTokenModalAccount(null)} onDone={load} />
       )}

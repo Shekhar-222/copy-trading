@@ -1,7 +1,13 @@
 import { useState } from 'react'
 import PnlBadge from './PnlBadge'
 
-export default function ChildCard({ account, masterCapital, pnl, onToggle, onLogin, onManualLogin, onDelete, onSetMultiplier, onExit, onShowPositions, onSwitchRole }) {
+const BROKER_LABELS = { kotak_neo: 'Kotak Neo', angel_one: 'Angel One', groww: 'Groww' }
+// These brokers' TOTP-based logins have no manual/browser fallback (auto-login only) and
+// can't become a master (see main.py's switch_role) - Zerodha is the only one without this
+// restriction on either front.
+const NO_MANUAL_LOGIN_OR_MASTER_BROKERS = ['kotak_neo', 'angel_one', 'groww']
+
+export default function ChildCard({ account, masterCapital, pnl, onToggle, onLogin, onManualLogin, onEdit, onDelete, onSetMultiplier, onExit, onShowPositions, onSwitchRole }) {
   const ratio = masterCapital > 0 ? Math.min((account.capital / masterCapital) * 100, 100) : 0
   const effectiveMultiplier = account.multiplier_override ?? (masterCapital > 0 ? account.capital / masterCapital : 0)
   const [editing, setEditing] = useState(false)
@@ -33,8 +39,7 @@ export default function ChildCard({ account, masterCapital, pnl, onToggle, onLog
         </span>
       </div>
       <div className="id" style={{ marginTop: -6 }}>
-        {account.client_id} · child ·{' '}
-        {account.broker === 'kotak_neo' ? 'Kotak Neo' : account.broker === 'angel_one' ? 'Angel One' : 'Zerodha'}
+        {account.client_id} · child · {BROKER_LABELS[account.broker] || 'Zerodha'}
       </div>
       {account.real_name && (
         <div className="real-name" title="Fetched from the Zerodha profile">
@@ -88,7 +93,7 @@ export default function ChildCard({ account, masterCapital, pnl, onToggle, onLog
         {!account.has_token_today && (
           <>
             <button className="btn small" onClick={() => onLogin(account.id)}>Auto-login</button>
-            {account.broker !== 'kotak_neo' && account.broker !== 'angel_one' && (
+            {!NO_MANUAL_LOGIN_OR_MASTER_BROKERS.includes(account.broker) && (
               <button className="btn small" onClick={() => onManualLogin(account)}>Manual token</button>
             )}
           </>
@@ -105,7 +110,8 @@ export default function ChildCard({ account, masterCapital, pnl, onToggle, onLog
         <button className="btn small danger" disabled={!account.has_token_today} onClick={() => onExit(account)}>
           Exit all
         </button>
-        {account.broker !== 'kotak_neo' && account.broker !== 'angel_one' && (
+        <button className="btn small" onClick={() => onEdit(account)}>Edit</button>
+        {!NO_MANUAL_LOGIN_OR_MASTER_BROKERS.includes(account.broker) && (
           <button
             className="btn small"
             disabled={account.active}

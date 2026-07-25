@@ -39,6 +39,7 @@ async function request(path, options = {}) {
 export const api = {
   listAccounts: () => request('/accounts'),
   createAccount: (data) => request('/accounts', { method: 'POST', body: JSON.stringify(data) }),
+  updateAccount: (id, data) => request(`/accounts/${id}`, { method: 'PATCH', body: JSON.stringify(data) }),
   deleteAccount: (id) => request(`/accounts/${id}`, { method: 'DELETE' }),
   toggleActive: (id) => request(`/accounts/${id}/toggle`, { method: 'PATCH' }),
   switchRole: (id, role) => request(`/accounts/${id}/role`, { method: 'PATCH', body: JSON.stringify({ role }) }),

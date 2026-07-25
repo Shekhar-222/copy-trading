@@ -10,14 +10,16 @@ export default function AddAccountModal({ onClose, onCreate }) {
 
   const set = (k) => (e) => setForm({ ...form, [k]: e.target.value })
 
+  const CHILD_ONLY_BROKERS = ['kotak_neo', 'angel_one', 'groww']
+
   const setBroker = (e) => {
     const broker = e.target.value
-    // Kotak Neo and Angel One are child-only for now - force role and drop irrelevant fields.
+    // Kotak Neo, Angel One, and Groww are child-only for now - force role and drop irrelevant fields.
     setForm({
       ...form,
       broker,
-      role: broker === 'kotak_neo' || broker === 'angel_one' ? 'child' : form.role,
-      api_secret: '', password: '', mpin: '', mobile_number: '',
+      role: CHILD_ONLY_BROKERS.includes(broker) ? 'child' : form.role,
+      api_secret: '', password: '', mpin: '', mobile_number: '', totp_secret: '',
     })
   }
 
@@ -42,10 +44,12 @@ export default function AddAccountModal({ onClose, onCreate }) {
 
   const isKotak = form.broker === 'kotak_neo'
   const isAngel = form.broker === 'angel_one'
-  const canSave = form.label && form.client_id && (
-    isKotak ? form.api_key && form.totp_secret && form.mpin && form.mobile_number
-    : isAngel ? form.api_key && form.totp_secret && form.mpin
-    : form.api_key && form.api_secret && form.totp_secret
+  const isGroww = form.broker === 'groww'
+  const canSave = form.label && (
+    isKotak ? form.client_id && form.api_key && form.totp_secret && form.mpin && form.mobile_number
+    : isAngel ? form.client_id && form.api_key && form.totp_secret && form.mpin
+    : isGroww ? form.api_key && (form.totp_secret ? !form.api_secret : form.api_secret) // client_id is optional/informational; exactly one of totp_secret/api_secret, matching the key type
+    : form.client_id && form.api_key && form.api_secret && form.totp_secret
   )
 
   return (
@@ -59,10 +63,57 @@ export default function AddAccountModal({ onClose, onCreate }) {
             <option value="zerodha">Zerodha (Kite Connect)</option>
             <option value="kotak_neo">Kotak Neo</option>
             <option value="angel_one">Angel One</option>
+            <option value="groww">Groww</option>
           </select>
         </div>
 
-        {isAngel ? (
+        {isGroww ? (
+          <>
+            <p className="hint">
+              Groww accounts can only be added as child accounts for now (the master feed stays on Zerodha).
+              Groww issues two different API key types, chosen when you generate the key on Groww's API Keys
+              page — a "TOTP" key (paired with a TOTP secret) or an "Approval" key (paired with a plain API
+              secret). Fill in only the one matching field below for whichever type you generated; using the
+              wrong one is rejected by Groww as "Invalid type provided". Groww's login token doesn't expire
+              daily like the other brokers', so you shouldn't need to re-login here every day — but an
+              "Approval" key needs a one-off manual approval in the Groww app before its first token can be
+              generated (confirmed live: it fails with "Session approval required" otherwise), so prefer a
+              "TOTP" key if you want Auto-login to work completely hands-off.
+            </p>
+            <div className="warning-box">
+              The TOTP/API secret is encrypted at rest, but only run this on a machine you trust — Groww login
+              has no manual/browser fallback, it always uses this credential directly.
+            </div>
+
+            <div className="field">
+              <label>Label</label>
+              <input placeholder="e.g. Groww child" value={form.label} onChange={set('label')} />
+            </div>
+            <div className="field">
+              <label>Role</label>
+              <input value="Child (receives copied trades)" disabled />
+            </div>
+            <div className="field">
+              <label>UCC / Client ID (optional, for your reference)</label>
+              <input placeholder="e.g. GRW1234" value={form.client_id} onChange={set('client_id')} />
+            </div>
+            <div className="field">
+              <label>API key</label>
+              <input value={form.api_key} onChange={set('api_key')} />
+            </div>
+            <div className="field">
+              <label>TOTP secret (base32) — only if you generated a "TOTP" type key</label>
+              <input value={form.totp_secret} onChange={set('totp_secret')} />
+            </div>
+            <div className="field">
+              <label>API secret — only if you generated an "Approval" type key</label>
+              <input value={form.api_secret} onChange={set('api_secret')} />
+            </div>
+            {form.totp_secret && form.api_secret && (
+              <div className="warning-box">Fill in only one of TOTP secret / API secret, not both — clear the one you're not using.</div>
+            )}
+          </>
+        ) : isAngel ? (
           <>
             <p className="hint">
               Angel One accounts can only be added as child accounts for now (the master feed stays on Zerodha).

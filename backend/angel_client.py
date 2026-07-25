@@ -26,6 +26,7 @@ docstring for why: a fresh TOTP login per action tripped Angel's rate limit on f
 import datetime
 import json
 import os
+import threading
 import time
 
 import requests
@@ -53,6 +54,10 @@ _INSTRUMENT_MASTER_URL = "https://margincalculator.angelbroking.com/OpenAPI_File
 _INSTRUMENT_MASTER_TTL = datetime.timedelta(hours=12)
 _INSTRUMENT_MASTER_CACHE_FILE = os.path.join(os.path.dirname(__file__), ".angel_scrip_master_cache.json")
 _instrument_master_cache = {"loaded_at": None, "by_exch_name": {}}
+# Children are now placed concurrently, one thread per child (see replication_engine's
+# _replicate_one_child) - this guards the cache load/refresh so two Angel One children
+# resolving contracts at the same moment don't race into two simultaneous 33MB downloads.
+_instrument_master_lock = threading.Lock()
 
 
 def _build_index(rows: list) -> dict:
@@ -74,31 +79,38 @@ def _load_instrument_master() -> dict:
     if _instrument_master_cache["loaded_at"] and now - _instrument_master_cache["loaded_at"] < _INSTRUMENT_MASTER_TTL:
         return _instrument_master_cache["by_exch_name"]
 
-    try:
-        mtime = datetime.datetime.utcfromtimestamp(os.path.getmtime(_INSTRUMENT_MASTER_CACHE_FILE))
-        if now - mtime < _INSTRUMENT_MASTER_TTL:
-            with open(_INSTRUMENT_MASTER_CACHE_FILE, "r", encoding="utf-8") as f:
-                rows = json.load(f)
+    with _instrument_master_lock:
+        # Re-check inside the lock - another thread may have already refreshed it while this
+        # one was waiting.
+        now = datetime.datetime.utcnow()
+        if _instrument_master_cache["loaded_at"] and now - _instrument_master_cache["loaded_at"] < _INSTRUMENT_MASTER_TTL:
+            return _instrument_master_cache["by_exch_name"]
+
+        try:
+            mtime = datetime.datetime.utcfromtimestamp(os.path.getmtime(_INSTRUMENT_MASTER_CACHE_FILE))
+            if now - mtime < _INSTRUMENT_MASTER_TTL:
+                with open(_INSTRUMENT_MASTER_CACHE_FILE, "r", encoding="utf-8") as f:
+                    rows = json.load(f)
+                _instrument_master_cache["by_exch_name"] = _build_index(rows)
+                _instrument_master_cache["loaded_at"] = now
+                return _instrument_master_cache["by_exch_name"]
+        except Exception:  # noqa: BLE001 - no usable disk cache, fall through to a network fetch
+            pass
+
+        try:
+            resp = requests.get(_INSTRUMENT_MASTER_URL, timeout=60)
+            resp.raise_for_status()
+            rows = resp.json()
             _instrument_master_cache["by_exch_name"] = _build_index(rows)
             _instrument_master_cache["loaded_at"] = now
-            return _instrument_master_cache["by_exch_name"]
-    except Exception:  # noqa: BLE001 - no usable disk cache, fall through to a network fetch
-        pass
-
-    try:
-        resp = requests.get(_INSTRUMENT_MASTER_URL, timeout=60)
-        resp.raise_for_status()
-        rows = resp.json()
-        _instrument_master_cache["by_exch_name"] = _build_index(rows)
-        _instrument_master_cache["loaded_at"] = now
-        try:
-            with open(_INSTRUMENT_MASTER_CACHE_FILE, "w", encoding="utf-8") as f:
-                json.dump(rows, f)
-        except Exception:  # noqa: BLE001 - disk write failing shouldn't lose the in-memory cache
+            try:
+                with open(_INSTRUMENT_MASTER_CACHE_FILE, "w", encoding="utf-8") as f:
+                    json.dump(rows, f)
+            except Exception:  # noqa: BLE001 - disk write failing shouldn't lose the in-memory cache
+                pass
+        except Exception:  # noqa: BLE001 - leave cache as-is (possibly empty on first-ever failure)
             pass
-    except Exception:  # noqa: BLE001 - leave cache as-is (possibly empty on first-ever failure)
-        pass
-    return _instrument_master_cache["by_exch_name"]
+        return _instrument_master_cache["by_exch_name"]
 
 
 def _client_for(account) -> object:
