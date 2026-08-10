@@ -211,7 +211,14 @@ def start_master_listener(master_account_id: int, broadcast=None):
         session = SessionLocal()
         try:
             m = session.query(models.Account).get(master_account_id)
-            replicate_order(session, m, data, broadcast=broadcast)
+            # When the master's app is shared with family-linked child accounts (same api_key,
+            # multiple permitted client IDs for the static-IP setup - see kite_auth.py), Kite
+            # delivers order-update events for EVERY permitted client on this one connection,
+            # not just the master's own orders. Without this check, a child's own mirrored order
+            # gets misread as a new master fill and replicated again - a self-feeding loop that
+            # placed ~20 duplicate orders in production. Only ever replicate the master's own.
+            if not data.get("user_id") or data["user_id"] == m.client_id:
+                replicate_order(session, m, data, broadcast=broadcast)
         finally:
             session.close()
         # A fill may have opened/closed a position - re-anchor and resubscribe right away

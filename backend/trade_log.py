@@ -13,7 +13,11 @@ import models
 
 def log_trade_event(db: Session, account: models.Account, exchange, tradingsymbol, transaction_type,
                      quantity, status: str, message: str, broadcast=None,
-                     master_order_id: str = None, child_order_id: str = None) -> dict:
+                     master_order_id: str = None, child_order_id: str = None,
+                     master_quantity: int = None) -> dict:
+    """`quantity` is the replicated (child-side) quantity. `master_quantity` defaults to the
+    same value, but callers that skip replication (e.g. a computed quantity of 0) should pass
+    the master's actual order quantity so the log doesn't read as "master traded 0"."""
     log = models.TradeLog(
         timestamp=datetime.datetime.utcnow(),
         master_order_id=master_order_id,
@@ -22,7 +26,7 @@ def log_trade_event(db: Session, account: models.Account, exchange, tradingsymbo
         tradingsymbol=tradingsymbol,
         exchange=exchange,
         transaction_type=transaction_type,
-        master_quantity=quantity,
+        master_quantity=master_quantity if master_quantity is not None else quantity,
         replicated_quantity=quantity,
         status=status,
         message=message,

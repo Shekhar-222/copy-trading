@@ -8,6 +8,7 @@ One, or Groww account - the master is always Zerodha (that's where the order-upd
 comes from), but children can be any of the four. See kotak_client.py / angel_client.py /
 groww_client.py for the non-Zerodha sides.
 """
+import collections
 import concurrent.futures
 import math
 import datetime
@@ -29,6 +30,29 @@ from trade_log import log_trade_event
 # one at a time, the dashboard's "Live replication feed" showed logs trailing several seconds
 # behind the master's actual fill, worst for whichever child happened to be last in the loop.
 _CHILD_REPLICATION_WORKERS = 8
+
+# Order IDs of every child order WE have placed as a mirror, regardless of which path placed it
+# (fill-then-copy or resting-order). When the master's Kite Connect app is shared across family
+# accounts (see kite_auth.py / the static-IP family setup), Kite's order-update WebSocket has been
+# observed delivering order-update events for the OTHER permitted client's own orders too, not just
+# the connecting master's - despite the client library's docs claiming it's scoped to "the connected
+# user". Without this guard, a child's own mirrored order comes back around as if it were a brand
+# new master fill and gets replicated again - a self-feeding loop that placed 150+ duplicate live
+# orders in production on 2026-08-03. Checked at the top of replicate_order() before anything else.
+# Capped (oldest evicted first) so a long-running process doesn't grow this forever - an
+# order-update echo for our own placement arrives within moments, never days later.
+_OWN_ORDER_ID_CAP = 5000
+_own_placed_order_ids = set()
+_own_placed_order_id_queue = collections.deque()
+
+
+def _mark_own_order(order_id) -> None:
+    order_id = str(order_id)
+    _own_placed_order_ids.add(order_id)
+    _own_placed_order_id_queue.append(order_id)
+    if len(_own_placed_order_id_queue) > _OWN_ORDER_ID_CAP:
+        _own_placed_order_ids.discard(_own_placed_order_id_queue.popleft())
+
 
 _NON_ZERODHA_PLACERS = {
     "kotak_neo": (kotak_client.place_child_order, "Order placed on Kotak Neo (market protection)"),
@@ -132,6 +156,11 @@ def replicate_order(db: Session, master_account: models.Account, order: dict, br
     problems, at the cost of the child's order landing a beat after the master's instead of
     resting independently.
     """
+    order_id = order.get("order_id")
+    if order_id and str(order_id) in _own_placed_order_ids:
+        return  # our own child mirror looping back through the shared app's order-update
+                # stream - never treat our own placement as a new master trigger
+
     exchange = order.get("exchange")
     status = order.get("status")
     if exchange in _DISABLED_EXCHANGES:
@@ -236,6 +265,7 @@ def _replicate_one_child(child_id: int, exchange: str, tradingsymbol: str, trans
                     price=limit_price,
                     product=product,
                 )
+                _mark_own_order(child_order_id)
                 log_trade_event(
                     db, child, exchange, tradingsymbol, transaction_type, slice_qty, "SUCCESS",
                     f"Order placed as LIMIT @ {limit_price} (market protection){note}.",
@@ -260,7 +290,8 @@ def _replicate_fill(db: Session, master_account: models.Account, order: dict, br
     _CHILD_REPLICATION_WORKERS comment above for why."""
     children = (
         db.query(models.Account)
-        .filter(models.Account.role == "child", models.Account.active == True)  # noqa: E712
+        .filter(models.Account.role == "child", models.Account.active == True,  # noqa: E712
+                models.Account.id != master_account.id)
         .all()
     )
 
@@ -293,7 +324,7 @@ def _replicate_fill(db: Session, master_account: models.Account, order: dict, br
                 log_trade_event(
                     db, child, exchange, tradingsymbol, transaction_type, qty, "SKIPPED",
                     "Computed replicated quantity was 0 (child capital too small for one lot).",
-                    broadcast, master_order_id=master_order_id,
+                    broadcast, master_order_id=master_order_id, master_quantity=order["quantity"],
                 )
                 continue
 
@@ -386,6 +417,7 @@ def _place_child_slices(db: Session, child: models.Account, master_order_id, exc
                 product=product,
                 **_price_kwargs(order_type, price, trigger_price),
             )
+            _mark_own_order(child_order_id)
             db.add(models.MirroredOrder(
                 master_order_id=master_order_id, child_account_id=child.id, child_order_id=str(child_order_id),
                 exchange=exchange, tradingsymbol=tradingsymbol, transaction_type=transaction_type,
@@ -561,7 +593,8 @@ def _handle_order_lifecycle(db: Session, master_account: models.Account, order: 
     # Place a matching one on every active child right away instead of waiting for it to fill.
     children = (
         db.query(models.Account)
-        .filter(models.Account.role == "child", models.Account.active == True)  # noqa: E712
+        .filter(models.Account.role == "child", models.Account.active == True,  # noqa: E712
+                models.Account.id != master_account.id)
         .all()
     )
     for child in children:
@@ -574,7 +607,7 @@ def _handle_order_lifecycle(db: Session, master_account: models.Account, order: 
             log_trade_event(
                 db, child, exchange, tradingsymbol, transaction_type, qty, "SKIPPED",
                 "Computed replicated quantity was 0 (child capital too small for one lot).",
-                broadcast, master_order_id=master_order_id,
+                broadcast, master_order_id=master_order_id, master_quantity=order.get("quantity", 0),
             )
             continue
 
@@ -687,6 +720,7 @@ def exit_account(db: Session, account: models.Account, broadcast=None) -> list:
                     price=limit_price,
                     product=pos.get("product", kite.PRODUCT_MIS),
                 )
+                _mark_own_order(order_id)
                 results.append(log_trade_event(
                     db, account, exchange, tradingsymbol, transaction_type, slice_qty,
                     "SUCCESS", f"Exited @ {limit_price} (order {order_id}){note}.", broadcast,
@@ -715,7 +749,8 @@ def _protected_limit_price(kite, exchange: str, tradingsymbol: str, transaction_
     ltp = kite.ltp(quote_key)[quote_key]["last_price"]
     buffer = ltp * (MARKET_PROTECTION_PCT / 100)
     raw_price = ltp + buffer if transaction_type == kite.TRANSACTION_TYPE_BUY else ltp - buffer
-    return round(raw_price * 20) / 20  # snap to the 0.05 tick size
+    tick_size = _get_tick_size(kite, exchange, tradingsymbol)
+    return round(round(raw_price / tick_size) * tick_size, 2)
 
 
 # Exchanges where lot size actually matters (equity is always 1, so skip the network round trip there).
@@ -740,6 +775,12 @@ def _get_instrument_detail(kite, exchange: str, tradingsymbol: str):
     """
     if exchange not in _LOT_SIZE_EXCHANGES:
         return None
+    return _lookup_instrument(kite, exchange, tradingsymbol)
+
+
+def _lookup_instrument(kite, exchange: str, tradingsymbol: str):
+    """Cache-lookup step shared by _get_instrument_detail and _get_tick_size - refreshes the
+    per-exchange instrument dump on a cache miss, then returns whatever's cached (or None)."""
     key = (exchange, tradingsymbol)
     if key not in _instrument_details:
         _refresh_instrument_cache(kite, exchange)
@@ -757,6 +798,15 @@ def _refresh_instrument_cache(kite, exchange: str) -> None:
         _instrument_cache_loaded_at[exchange] = now
     except Exception:  # noqa: BLE001 - leave cache as-is, callers fall back to a guess
         pass
+
+
+def _get_tick_size(kite, exchange: str, tradingsymbol: str) -> float:
+    """Real tick size for any exchange, not just F&O - equity scripts aren't all 0.05 (some are
+    0.10 or more), so _protected_limit_price needs the actual instrument value rather than a
+    guess. Unlike _get_instrument_detail this doesn't skip equity exchanges, since tick size
+    (unlike lot size) isn't a safe constant to assume there."""
+    instrument = _lookup_instrument(kite, exchange, tradingsymbol)
+    return (instrument or {}).get("tick_size") or 0.05
 
 
 def _guess_lot_size(tradingsymbol: str) -> int:

@@ -46,6 +46,7 @@ export const api = {
   setMultiplier: (id, multiplier_override) =>
     request(`/accounts/${id}/multiplier`, { method: 'PATCH', body: JSON.stringify({ multiplier_override }) }),
   autoLogin: (id) => request(`/accounts/${id}/auto-login`, { method: 'POST' }),
+  logout: (id) => request(`/accounts/${id}/logout`, { method: 'POST' }),
   getLoginUrl: (id) => request(`/accounts/${id}/login-url`),
   manualToken: (id, request_token) =>
     request(`/accounts/${id}/manual-token`, { method: 'POST', body: JSON.stringify({ request_token }) }),

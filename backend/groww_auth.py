@@ -45,6 +45,20 @@ import uuid
 import pyotp
 import requests
 from growwapi import GrowwAPI
+import growwapi.groww.client as _growwapi_client_module
+
+# GrowwAPI.__init__ calls colorama.init(autoreset=True) on *every* construction (once per
+# _client_for() call here). colorama.init() re-wraps the process-global sys.stdout/stderr, and
+# under FastAPI's threadpool - multiple requests each constructing their own GrowwAPI client
+# concurrently, on different OS threads - two of those re-wraps racing corrupts the wrapper into
+# a self-referential loop, causing RecursionError on the next write() from *any* thread, not just
+# Groww's. Confirmed live, 2026-07-28: this is what was intermittently blanking Groww's P&L (the
+# recursion gets caught by the broker call's own try/except and silently turned into None), and
+# almost certainly what caused the earlier total-backend-freeze this session (identical
+# RecursionError signature, just triggered via a different log call). stdout is redirected to a
+# log file in every deployment here anyway, so colorama's ANSI-to-Win32 translation has no
+# purpose to begin with - neutralizing the repeated re-init is a pure fix, not a workaround.
+_growwapi_client_module.init = lambda *a, **k: None
 
 _TOKEN_URL = "https://api.groww.in/v1/token/api/access"
 

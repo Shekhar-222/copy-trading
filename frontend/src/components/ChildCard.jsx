@@ -7,7 +7,7 @@ const BROKER_LABELS = { kotak_neo: 'Kotak Neo', angel_one: 'Angel One', groww: '
 // restriction on either front.
 const NO_MANUAL_LOGIN_OR_MASTER_BROKERS = ['kotak_neo', 'angel_one', 'groww']
 
-export default function ChildCard({ account, masterCapital, pnl, onToggle, onLogin, onManualLogin, onEdit, onDelete, onSetMultiplier, onExit, onShowPositions, onSwitchRole }) {
+export default function ChildCard({ account, masterCapital, pnl, onToggle, onLogin, onLogout, onManualLogin, onEdit, onDelete, onSetMultiplier, onExit, onShowPositions, onSwitchRole }) {
   const ratio = masterCapital > 0 ? Math.min((account.capital / masterCapital) * 100, 100) : 0
   const effectiveMultiplier = account.multiplier_override ?? (masterCapital > 0 ? account.capital / masterCapital : 0)
   const [editing, setEditing] = useState(false)
@@ -110,6 +110,9 @@ export default function ChildCard({ account, masterCapital, pnl, onToggle, onLog
         <button className="btn small danger" disabled={!account.has_token_today} onClick={() => onExit(account)}>
           Exit all
         </button>
+        {account.has_token_today && (
+          <button className="btn small" onClick={() => onLogout(account.id)}>Logout</button>
+        )}
         <button className="btn small" onClick={() => onEdit(account)}>Edit</button>
         {!NO_MANUAL_LOGIN_OR_MASTER_BROKERS.includes(account.broker) && (
           <button

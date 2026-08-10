@@ -312,6 +312,16 @@ def create_account(payload: AccountCreate, db: Session = Depends(get_db)):
     return _to_out(acc)
 
 
+def _invalidate_token(acc: models.Account) -> None:
+    """Clears the stored access token, forcing a fresh Auto-login/manual token before the
+    account trades again. Also stops a live master listener - it would otherwise keep running
+    against a now-discarded token until it happens to reconnect."""
+    acc.access_token_enc = None
+    acc.token_generated_at = None
+    if acc.role == "master":
+        stop_master_listener(acc.id)
+
+
 @app.patch("/accounts/{account_id}")
 def update_account(account_id: int, payload: AccountUpdate, db: Session = Depends(get_db)):
     """Edits an existing account's label/credentials in place, so a typo'd or outdated
@@ -356,12 +366,7 @@ def update_account(account_id: int, payload: AccountUpdate, db: Session = Depend
         acc.mobile_number = payload.mobile_number.strip()
 
     if credential_touched:
-        acc.access_token_enc = None
-        acc.token_generated_at = None
-        if acc.role == "master":
-            # A live listener authenticated under the old credentials would otherwise keep
-            # running against now-discarded api_key/secret until it happens to reconnect.
-            stop_master_listener(acc.id)
+        _invalidate_token(acc)
 
     db.commit()
     db.refresh(acc)
@@ -530,6 +535,7 @@ def auto_login(account_id: int, db: Session = Depends(get_db)):
             api_key=crypto_utils.decrypt(acc.api_key_enc),
             api_secret=crypto_utils.decrypt(acc.api_secret_enc),
             request_token=request_token,
+            expected_client_id=acc.client_id,
         )
     except LoginError as e:
         raise HTTPException(400, f"Auto-login failed: {e}. Try the manual token method.")
@@ -573,6 +579,7 @@ def manual_token(account_id: int, payload: ManualTokenIn, db: Session = Depends(
             api_key=crypto_utils.decrypt(acc.api_key_enc),
             api_secret=crypto_utils.decrypt(acc.api_secret_enc),
             request_token=payload.request_token,
+            expected_client_id=acc.client_id,
         )
     except Exception as e:
         raise HTTPException(400, f"Token exchange failed: {e}")
@@ -586,6 +593,20 @@ def manual_token(account_id: int, payload: ManualTokenIn, db: Session = Depends(
     if acc.role == "master" and acc.active:
         start_master_listener(acc.id, broadcast=broadcast)
 
+    return _to_out(acc)
+
+
+@app.post("/accounts/{account_id}/logout")
+def logout(account_id: int, db: Session = Depends(get_db)):
+    """Clears the stored access token so the account goes back to NO TOKEN and needs a fresh
+    Auto-login/manual token before trading again. Mainly useful for Groww/Angel, whose tokens
+    don't expire on their own the way Zerodha/Kotak's daily tokens do - see _token_is_fresh."""
+    acc = db.query(models.Account).get(account_id)
+    if not acc:
+        raise HTTPException(404, "not found")
+    _invalidate_token(acc)
+    db.commit()
+    db.refresh(acc)
     return _to_out(acc)
 
 

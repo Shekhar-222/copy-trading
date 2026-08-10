@@ -252,13 +252,23 @@ def place_child_order(account, exchange: str, tradingsymbol: str, transaction_ty
 
 
 def get_margin(account) -> float:
+    """"clear_cash" alone is only unpledged free cash and ignores collateral entirely - for a
+    collateral-funded account it under-reports real usable capital by orders of magnitude (a
+    real account here showed clear_cash=19.67 while fno/mis balance_available was 3,91,650.01),
+    the same trap already flagged for Zerodha's margins() call in main.py. cash +
+    collateral_available - margin_used matches Groww's own balance_available figures exactly -
+    confirmed live, 2026-07-27."""
     client = _client_for(account)
     try:
         resp = client.get_available_margin_details()
     except BaseGrowwException as e:
         raise ValueError(e.msg)
     try:
-        return float((resp or {}).get("clear_cash", 0.0))
+        resp = resp or {}
+        cash = float(resp.get("clear_cash", 0.0))
+        collateral = float(resp.get("collateral_available", 0.0))
+        used = float(resp.get("net_margin_used", 0.0))
+        return cash + collateral - used
     except (TypeError, ValueError):
         return 0.0
 
@@ -305,16 +315,50 @@ def get_positions(account) -> list:
 
 
 def get_pnl(account):
-    """Best-effort running P&L for a Groww account - realised_pnl only, no live-LTP unrealized
-    leg (same caveat as Kotak Neo's get_pnl). Returns None (shown as "-" in the dashboard) if
-    positions can't be fetched, rather than risk a wrong number."""
+    """Running P&L for a Groww account - Groww's own realised_pnl per position, plus a live-LTP
+    unrealized leg for still-open ones, computed the same way Kite's own P&L is: (ltp -
+    entry_price) * signed quantity, per leg. Groww's positions API doesn't return a ready-made
+    live P&L the way Kite's does (every leg's realised_pnl reads 0.0 until actually closed, even
+    with real open exposure), so this fetches LTP for every open position in one batched call per
+    segment and computes it here - confirmed live, 2026-07-28, against a real account with 4 open
+    F&O legs (all realised_pnl=0; summing (ltp - net_price) * quantity per leg matched the
+    account's real unrealized move). Falls back to realised-only, or None if positions can't be
+    fetched at all, rather than risk a wrong number - an LTP batch failure for one segment just
+    skips that segment's unrealized leg instead of failing the whole figure."""
     try:
         client = _client_for(account)
         resp = client.get_positions_for_user()
         rows = resp.get("positions") if isinstance(resp, dict) else resp
         if not isinstance(rows, list):
             return None
-        return sum(float(p.get("realised_pnl", 0) or 0) for p in rows)
+
+        total = sum(float(p.get("realised_pnl", 0) or 0) for p in rows)
+
+        open_rows = [p for p in rows if float(p.get("quantity", 0) or 0) != 0]
+        if not open_rows:
+            return total
+
+        by_segment = {}
+        for p in open_rows:
+            key = f"{p.get('exchange')}_{p.get('trading_symbol')}"
+            by_segment.setdefault(p.get("segment"), {})[key] = p
+
+        for segment, by_key in by_segment.items():
+            try:
+                ltp_resp = client.get_ltp(exchange_trading_symbols=tuple(by_key.keys()), segment=segment)
+            except Exception:  # noqa: BLE001 - skip this segment's unrealized leg, keep the rest
+                continue
+            if not isinstance(ltp_resp, dict):
+                continue
+            for key, p in by_key.items():
+                ltp = ltp_resp.get(key)
+                if ltp is None:
+                    continue
+                entry = float(p.get("net_price", 0) or 0)
+                qty = float(p.get("quantity", 0) or 0)
+                total += (float(ltp) - entry) * qty
+
+        return total
     except Exception:  # noqa: BLE001
         return None
 

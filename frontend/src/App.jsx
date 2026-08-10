@@ -36,27 +36,58 @@ export default function App() {
 
   useEffect(() => {
     load()
-    const ws = new WebSocket(api.wsUrl())
-    ws.onopen = () => {
-      const token = accessToken.get()
-      if (token) ws.send(token) // first message doubles as the WS auth handshake - see main.py
-    }
-    ws.onmessage = (evt) => {
-      const payload = JSON.parse(evt.data)
-      if (payload.event === 'pnl') {
-        // tick-driven P&L push - swap state directly, no REST round-trip
-        setPnl(payload)
-      } else if (payload.status) {
-        setLogs((prev) => [payload, ...prev].slice(0, 200))
-        api.getPnl().then(setPnl)
-      } else {
-        // status/connection events - just re-sync
-        load()
+    let cancelled = false
+    let reconnectTimer = null
+
+    const connect = () => {
+      const ws = new WebSocket(api.wsUrl())
+      wsRef.current = ws
+      ws.onopen = () => {
+        const token = accessToken.get()
+        if (token) ws.send(token) // first message doubles as the WS auth handshake - see main.py
+      }
+      ws.onmessage = (evt) => {
+        const payload = JSON.parse(evt.data)
+        if (payload.event === 'pnl') {
+          // tick-driven P&L push - Zerodha accounts only (the live ticker feed is Kite's; Kotak/
+          // Angel/Groww have no WS market-data subscription here and keep whatever their last
+          // 15s-poll value was). Merge by account id instead of replacing wholesale, or every
+          // account missing from this tick would flicker to blank the instant a tick lands,
+          // instead of just holding its last known value. payload.total only sums the accounts
+          // in this tick (Zerodha), so the aggregate needs recomputing over the merged set too.
+          setPnl((prev) => {
+            const byId = new Map(prev.accounts.map((a) => [a.id, a]))
+            for (const a of payload.accounts) byId.set(a.id, a)
+            const accounts = [...byId.values()]
+            const total = accounts.reduce((sum, a) => sum + (a.pnl ?? 0), 0)
+            return { accounts, total }
+          })
+        } else if (payload.status) {
+          setLogs((prev) => [payload, ...prev].slice(0, 200))
+          api.getPnl().then(setPnl)
+        } else {
+          // status/connection events - just re-sync
+          load()
+        }
+      }
+      // A closed socket with no reconnect leaves the dashboard silently stuck on 15s polling
+      // forever (no error, nothing visibly "broken") the moment the backend restarts or a
+      // connection blips - reconnect after a short delay so the live tick stream self-heals
+      // instead of requiring a manual page refresh.
+      ws.onclose = () => {
+        if (cancelled) return
+        reconnectTimer = setTimeout(connect, 2000)
       }
     }
-    wsRef.current = ws
+    connect()
+
     const poll = setInterval(load, 15000)
-    return () => { ws.close(); clearInterval(poll) }
+    return () => {
+      cancelled = true
+      clearTimeout(reconnectTimer)
+      wsRef.current?.close()
+      clearInterval(poll)
+    }
   }, [load])
 
   useEffect(() => {
@@ -87,6 +118,10 @@ export default function App() {
   }
   const handleAutoLogin = async (id) => {
     try { await api.autoLogin(id); await load() }
+    catch (e) { alert(e.message) }
+  }
+  const handleLogout = async (id) => {
+    try { await api.logout(id); await load() }
     catch (e) { alert(e.message) }
   }
   const handleSetMultiplier = async (id, val) => { await api.setMultiplier(id, val); await load() }
@@ -130,6 +165,7 @@ export default function App() {
             pnl={pnlFor(m.id)}
             onToggle={handleToggle}
             onLogin={handleAutoLogin}
+            onLogout={handleLogout}
             onManualLogin={setTokenModalAccount}
             onEdit={setEditTarget}
             onDelete={setDeleteTarget}
@@ -155,6 +191,7 @@ export default function App() {
                 pnl={pnlFor(c.id)}
                 onToggle={handleToggle}
                 onLogin={handleAutoLogin}
+                onLogout={handleLogout}
                 onManualLogin={setTokenModalAccount}
                 onEdit={setEditTarget}
                 onDelete={setDeleteTarget}

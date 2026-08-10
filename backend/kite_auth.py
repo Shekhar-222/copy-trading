@@ -79,10 +79,25 @@ def auto_generate_request_token(client_id: str, password: str, totp_secret: str,
         raise LoginError(f"Network error while logging in: {e}")
 
 
-def generate_access_token(api_key: str, api_secret: str, request_token: str) -> str:
-    """Official Kite Connect call - exchanges a request_token for a day's access_token."""
+def generate_access_token(api_key: str, api_secret: str, request_token: str, expected_client_id: str = None) -> str:
+    """Official Kite Connect call - exchanges a request_token for a day's access_token.
+
+    expected_client_id, when given, is checked against generate_session()'s own user_id field
+    before the token is trusted. Necessary now that one app/api_key can be shared across family
+    accounts (the static-IP setup): a mixed-up login - wrong account's button clicked, or some
+    quirk of Kite's session handling on a shared app - can silently hand back a token for a
+    DIFFERENT client than the one you meant to log in. Without this check, that token still
+    "works" (every call succeeds), it just silently trades on the wrong person's real account -
+    exactly what happened to Tatya's account on 2026-08-03, where its stored token turned out to
+    authenticate as MAP014 instead of SOS452.
+    """
     kite = KiteConnect(api_key=api_key)
     data = kite.generate_session(request_token, api_secret=api_secret)
+    if expected_client_id and data.get("user_id") != expected_client_id:
+        raise LoginError(
+            f"Logged in as {data.get('user_id')}, not {expected_client_id} - wrong account "
+            "(easy mix-up when accounts share one app). Token discarded, nothing was saved."
+        )
     return data["access_token"]
 
 
