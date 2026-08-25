@@ -56,6 +56,7 @@ export const api = {
   getLogs: () => request('/logs'),
   getTicker: () => request('/ticker'),
   getStatus: () => request('/status'),
+  getPublicIp: (force) => request(`/system/ip${force ? '?force=true' : ''}`),
   getPnl: () => request('/pnl'),
   // Token is sent as the WebSocket's first message (see App.jsx), not a query param here -
   // a query param would end up in uvicorn's plaintext access log on every connection.

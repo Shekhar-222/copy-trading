@@ -67,6 +67,70 @@ body {
   font-variant-numeric: tabular-nums;
 }
 
+.server-ip {
+  display: flex;
+  align-items: center;
+  gap: 6px;
+  padding: 5px 12px;
+  border-radius: 999px;
+  border: 1px solid var(--border);
+  background: var(--bg-panel-raised);
+  color: var(--text-muted);
+  font-size: 12px;
+  font-family: var(--font-mono);
+  cursor: pointer;
+}
+
+.server-ip:hover {
+  color: var(--text-primary);
+  border-color: var(--teal);
+}
+
+.server-ip .server-ip-label {
+  color: var(--text-muted);
+  text-transform: uppercase;
+  font-size: 10px;
+  letter-spacing: 0.04em;
+}
+
+.server-ip .server-ip-value {
+  color: var(--text-primary);
+  font-weight: 600;
+}
+
+.ip-change-toast {
+  position: fixed;
+  top: 16px;
+  left: 50%;
+  transform: translateX(-50%);
+  z-index: 1000;
+  display: flex;
+  align-items: center;
+  gap: 12px;
+  padding: 10px 16px;
+  border-radius: 10px;
+  border: 1px solid var(--amber);
+  background: var(--bg-panel-raised);
+  color: var(--text-primary);
+  font-size: 13px;
+  font-family: var(--font-mono);
+  box-shadow: 0 4px 20px -4px rgba(232, 163, 61, 0.4);
+}
+
+.ip-change-toast-close {
+  background: none;
+  border: none;
+  color: var(--text-muted);
+  font-size: 16px;
+  line-height: 1;
+  cursor: pointer;
+  padding: 0;
+}
+
+.ip-change-toast-close:hover {
+  color: var(--text-primary);
+}
+
 /* ---- Scrolling index ticker tape (below the topbar) ---- */
 .ticker-tape {
   overflow: hidden;

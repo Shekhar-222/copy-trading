@@ -21,13 +21,19 @@ subclasses, each with a .msg attribute) rather than returning a silent {"status"
 the way Kotak/Angel's SDKs do, so error handling here is a plain try/except surfacing e.msg
 verbatim instead of manual response-shape validation.
 
-Order placement uses a real ORDER_TYPE_MARKET order (Groww documents native MARKET order
-support, unlike Kite which rejects one outright) rather than the protected-LIMIT workaround
-Zerodha/Angel need - still unverified against a live account. Whether Groww's place_order()
-response can be trusted as final is also unverified (its order_status enum has several
-transitional values like NEW/ACKED), so a short-delay follow-up status check is applied here
-too, following the exact lesson from angel_client._raise_if_rejected: a real insufficient-funds
-rejection got silently logged as SUCCESS there until that check was added.
+Order placement used a real ORDER_TYPE_MARKET order at first (Groww documents native MARKET
+order support, unlike Kite which rejects one outright), but switched to the same
+protected-LIMIT technique as Zerodha/Angel/Kotak for consistency - a real MARKET order has no
+slippage cap, and on a fast-moving option leg that made the fill price unpredictable in a way
+that could cascade into margin shortfalls on the next leg. See
+replication_engine._protected_limit_price for the technique; _protected_limit_price below
+mirrors it using Groww's own get_ltp() and the instrument CSV's real tick_size.
+
+Whether Groww's place_order() response can be trusted as final is also unverified (its
+order_status enum has several transitional values like NEW/ACKED), so a short-delay follow-up
+status check is applied here too, following the exact lesson from angel_client._raise_if_rejected:
+a real insufficient-funds rejection got silently logged as SUCCESS there until that check was
+added.
 """
 import csv
 import datetime
@@ -58,6 +64,8 @@ _PRODUCT_TYPE = {"MIS": "MIS", "CNC": "CNC", "NRML": "NRML"}
 _TRANSACTION_TYPE = {"BUY": "BUY", "SELL": "SELL"}
 _ORDER_REJECTED_STATUSES = {"rejected", "failed"}
 _OPEN_ORDER_STATUSES = {"new", "acked", "trigger_pending", "approved", "modification_requested"}
+
+MARKET_PROTECTION_PCT = 5  # matches replication_engine's/angel_client's/kotak_client's buffer
 
 # Groww's public instrument list - a single CSV covering every exchange/segment, not a live
 # search API. ~21MB (confirmed live), so cached both in memory AND on disk from the start -
@@ -145,20 +153,21 @@ def _client_for(account) -> object:
 
 
 def _resolve_equity(exchange: str, tradingsymbol: str) -> tuple:
-    """Returns (trading_symbol, exchange_token, lot_size). Groww's equity trading_symbol has
-    no suffix (confirmed live: "RELIANCE", not "RELIANCE-EQ" - that's a separate
-    internal_trading_symbol column not used for order placement)."""
+    """Returns (trading_symbol, exchange_token, lot_size, tick_size). Groww's equity
+    trading_symbol has no suffix (confirmed live: "RELIANCE", not "RELIANCE-EQ" - that's a
+    separate internal_trading_symbol column not used for order placement)."""
     by_symbol, _ = _load_instrument_master()
     row = by_symbol.get((exchange, tradingsymbol.upper()))
     if not row:
         raise ValueError(f"Could not find a matching Groww equity scrip for {tradingsymbol} on {exchange}.")
-    return row["trading_symbol"], row.get("exchange_token"), int(float(row.get("lot_size") or 1))
+    return (row["trading_symbol"], row.get("exchange_token"), int(float(row.get("lot_size") or 1)),
+            float(row.get("tick_size") or 0.05))
 
 
 def _resolve_fo(exchange: str, instrument: dict) -> tuple:
-    """Returns (trading_symbol, exchange_token, lot_size) for an F&O contract, resolved from
-    Kite's structured instrument fields. Confirmed live against Groww's real CSV: F&O rows key
-    on "underlying_symbol" (not "name", which is blank for F&O rows), expiry is ISO
+    """Returns (trading_symbol, exchange_token, lot_size, tick_size) for an F&O contract,
+    resolved from Kite's structured instrument fields. Confirmed live against Groww's real CSV:
+    F&O rows key on "underlying_symbol" (not "name", which is blank for F&O rows), expiry is ISO
     "YYYY-MM-DD", strike_price is a plain unscaled number, and instrument_type is CE/PE/FUT -
     the same values Kite itself uses, no translation table needed."""
     name = str(instrument.get("name", "")).upper()
@@ -185,10 +194,30 @@ def _resolve_fo(exchange: str, instrument: dict) -> tuple:
                 continue
         elif row_type != "FUT":
             continue
-        return row["trading_symbol"], row.get("exchange_token"), int(float(row.get("lot_size") or 1))
+        return (row["trading_symbol"], row.get("exchange_token"), int(float(row.get("lot_size") or 1)),
+                float(row.get("tick_size") or 0.05))
     raise ValueError(
         f"Could not find a matching Groww contract for {name} {expiry_str} {strike} {option_type} on {exchange}."
     )
+
+
+def _ltp(client, groww_exchange: str, segment: str, trading_symbol: str) -> float:
+    key = f"{groww_exchange}_{trading_symbol}"
+    resp = client.get_ltp(exchange_trading_symbols=(key,), segment=segment)
+    if not isinstance(resp, dict) or resp.get(key) is None:
+        raise ValueError(f"Groww get_ltp() did not return a price for {key}: {resp}")
+    return float(resp[key])
+
+
+def _protected_limit_price(client, groww_exchange: str, segment: str, trading_symbol: str,
+                            tick_size: float, transaction_type: str) -> float:
+    """Same market-protection technique as replication_engine._protected_limit_price - see this
+    module's docstring for why a plain MARKET order was dropped in favor of this."""
+    ltp = _ltp(client, groww_exchange, segment, trading_symbol)
+    buffer = ltp * (MARKET_PROTECTION_PCT / 100)
+    raw_price = ltp + buffer if transaction_type == "BUY" else ltp - buffer
+    tick = tick_size or 0.05
+    return round(round(raw_price / tick) * tick, 2)
 
 
 def _raise_if_rejected(client, segment: str, groww_order_id: str) -> None:
@@ -211,8 +240,8 @@ def _raise_if_rejected(client, segment: str, groww_order_id: str) -> None:
 
 def place_child_order(account, exchange: str, tradingsymbol: str, transaction_type: str,
                        quantity: int, product: str, instrument: dict = None) -> str:
-    """Places a MARKET order on a Groww child account, translating the master's Kite
-    exchange/symbol into the equivalent Groww contract first. `instrument` is the full Kite
+    """Places a market-protected LIMIT order on a Groww child account, translating the master's
+    Kite exchange/symbol into the equivalent Groww contract first. `instrument` is the full Kite
     instrument record when the trade is F&O, None for equity."""
     groww_exchange = _EXCHANGE.get(exchange)
     segment = _SEGMENT.get(exchange)
@@ -221,20 +250,24 @@ def place_child_order(account, exchange: str, tradingsymbol: str, transaction_ty
 
     client = _client_for(account)
     if instrument is not None:
-        symbol, _token, _lot_size = _resolve_fo(groww_exchange, instrument)
+        symbol, _token, _lot_size, tick_size = _resolve_fo(groww_exchange, instrument)
     else:
-        symbol, _token, _lot_size = _resolve_equity(groww_exchange, tradingsymbol)
+        symbol, _token, _lot_size, tick_size = _resolve_equity(groww_exchange, tradingsymbol)
+
+    groww_txn_type = _TRANSACTION_TYPE.get(transaction_type, transaction_type)
+    limit_price = _protected_limit_price(client, groww_exchange, segment, symbol, tick_size, groww_txn_type)
 
     try:
         resp = client.place_order(
             trading_symbol=symbol,
             quantity=quantity,
+            price=limit_price,
             validity=client.VALIDITY_DAY,
             exchange=groww_exchange,
             segment=segment,
             product=_PRODUCT_TYPE.get(product, "MIS"),
-            order_type=client.ORDER_TYPE_MARKET,
-            transaction_type=_TRANSACTION_TYPE.get(transaction_type, transaction_type),
+            order_type=client.ORDER_TYPE_LIMIT,
+            transaction_type=groww_txn_type,
         )
     except BaseGrowwException as e:
         raise ValueError(e.msg)

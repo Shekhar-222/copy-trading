@@ -33,6 +33,18 @@ def log_trade_event(db: Session, account: models.Account, exchange, tradingsymbo
     )
     db.add(log)
     db.commit()
+    if status != "SKIPPED":
+        # A SKIPPED row means no order was actually placed (e.g. capital too small for one
+        # lot) - only a real placement attempt should count as "an order was punched" and
+        # start the Telegram digest loop. Imported here, not at module level, to avoid a
+        # circular import (telegram_notify -> pnl -> {kotak,angel,groww}_client -> trade_log).
+        # Broad except is deliberate: this is a side-channel notification, never allowed to
+        # break real trade logging/broadcast if anything about it misbehaves.
+        try:
+            import telegram_notify
+            telegram_notify.ensure_running(log.id)
+        except Exception:  # noqa: BLE001
+            pass
     payload = to_dict(log, account.label)
     if broadcast:
         broadcast(payload)

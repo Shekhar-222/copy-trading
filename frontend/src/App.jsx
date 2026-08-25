@@ -24,7 +24,11 @@ export default function App() {
   const [exiting, setExiting] = useState(false)
   const [positionsTarget, setPositionsTarget] = useState(null)
   const [now, setNow] = useState(new Date())
+  const [serverIp, setServerIp] = useState(null)
+  const [ipCopied, setIpCopied] = useState(false)
+  const [ipChangeNotice, setIpChangeNotice] = useState(null)
   const wsRef = useRef(null)
+  const prevIpRef = useRef(null)
 
   const load = useCallback(async () => {
     const [accs, l, s, p] = await Promise.all([api.listAccounts(), api.getLogs(), api.getStatus(), api.getPnl()])
@@ -95,6 +99,41 @@ export default function App() {
     return () => clearInterval(clock)
   }, [])
 
+  const applyIp = useCallback((ip) => {
+    // A changed IP needs re-whitelisting with brokers before trading resumes, so it's flagged
+    // with an on-screen banner rather than just quietly updating the pill - stays up until the
+    // user dismisses it, since a silent auto-hide defeats the point of the alert.
+    if (prevIpRef.current && ip !== prevIpRef.current) {
+      setIpChangeNotice({ from: prevIpRef.current, to: ip })
+    }
+    prevIpRef.current = ip
+    setServerIp(ip)
+  }, [])
+
+  useEffect(() => {
+    // Server's outbound public IP - shown so it can be whitelisted with brokers (e.g. Kotak
+    // Neo) that require it. Polled fairly often, and re-fetched (bypassing the cache) whenever
+    // the tab regains focus, since that's typically when a network/VPN switch would be noticed.
+    const loadIp = (force) => api.getPublicIp(force).then((r) => applyIp(r.ip)).catch(() => {})
+    loadIp()
+    const poll = setInterval(() => loadIp(), 30000)
+    const onFocus = () => loadIp(true)
+    window.addEventListener('focus', onFocus)
+    return () => {
+      clearInterval(poll)
+      window.removeEventListener('focus', onFocus)
+    }
+  }, [applyIp])
+
+  const handleCopyIp = () => {
+    if (!serverIp) return
+    navigator.clipboard.writeText(serverIp).then(() => {
+      setIpCopied(true)
+      setTimeout(() => setIpCopied(false), 1500)
+    })
+    api.getPublicIp(true).then((r) => applyIp(r.ip)).catch(() => {})
+  }
+
   const masters = accounts.filter((a) => a.role === 'master')
   const children = accounts.filter((a) => a.role === 'child')
   const masterCapital = masters[0]?.capital || 0
@@ -139,6 +178,12 @@ export default function App() {
 
   return (
     <div className="app">
+      {ipChangeNotice && (
+        <div className="ip-change-toast">
+          Your IP has changed: {ipChangeNotice.from} → {ipChangeNotice.to}
+          <button className="ip-change-toast-close" onClick={() => setIpChangeNotice(null)}>×</button>
+        </div>
+      )}
       <div className="topbar">
         <h1><span className="dot" /> Copy Trading </h1>
         <div className="row" style={{ gap: 16 }}>
@@ -148,6 +193,17 @@ export default function App() {
             <span className="clock">{now.toLocaleTimeString('en-IN', { hour: '2-digit', minute: '2-digit', second: '2-digit', hour12: true })}</span>
             {' · NSE F&O'}
           </span>
+          {serverIp && (
+            <span
+              className="server-ip"
+              title="Server's public IP - whitelist this with brokers that require it (e.g. Kotak Neo). Click to refresh and copy."
+              onClick={handleCopyIp}
+            >
+              <span className="server-ip-label">IP</span>
+              <span className="server-ip-value">{serverIp}</span>
+              {ipCopied && <span>copied</span>}
+            </span>
+          )}
           <PnlBadge label="Aggregate P&L" value={pnl.total} layout="pill" size="lg" />
         </div>
       </div>

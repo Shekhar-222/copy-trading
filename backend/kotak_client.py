@@ -21,7 +21,7 @@ import crypto_utils
 from kotak_auth import get_kotak_client
 from trade_log import log_trade_event
 
-MARKET_PROTECTION_PCT = 0.5  # matches replication_engine's Zerodha buffer
+MARKET_PROTECTION_PCT = 5  # matches replication_engine's Zerodha buffer
 
 _EXCHANGE_SEGMENT = {
     "NSE": "nse_cm",

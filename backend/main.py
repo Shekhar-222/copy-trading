@@ -4,6 +4,7 @@ import asyncio
 import datetime
 from typing import Optional, List
 
+import requests
 from fastapi import FastAPI, Depends, HTTPException, Request, WebSocket, WebSocketDisconnect
 from fastapi.middleware.cors import CORSMiddleware
 from fastapi.responses import JSONResponse
@@ -26,6 +27,7 @@ from groww_auth import GrowwLoginError
 import groww_client
 from ticker_listener import start_master_listener, stop_master_listener, is_running
 from replication_engine import exit_account
+from pnl import token_is_fresh, compute_pnl
 import trade_log
 
 load_dotenv()
@@ -124,8 +126,23 @@ async def on_startup():
             .all()
         )
         for m in masters:
-            if _token_is_fresh(m):
+            if token_is_fresh(m):
                 start_master_listener(m.id, broadcast=broadcast)
+
+        # The Telegram digest loop's "has an order been punched" state lives in memory (see
+        # telegram_notify.py) and resets on every restart. Without this, a restart mid-session
+        # would silently go quiet until the next brand-new order, even though today's
+        # already-placed orders are sitting right there - re-arm immediately if there's any,
+        # so the very first digest after a restart still reports on them.
+        first_today = (
+            db.query(models.TradeLog)
+            .filter(models.TradeLog.timestamp >= trade_log.today_ist_start_utc())
+            .order_by(models.TradeLog.id.asc())
+            .first()
+        )
+        if first_today:
+            import telegram_notify
+            telegram_notify.ensure_running(first_today.id)
     finally:
         db.close()
 
@@ -233,18 +250,6 @@ class RoleIn(BaseModel):
 
 
 # ---------------------------- Helpers ----------------------------
-def _token_is_fresh(acc: models.Account) -> bool:
-    if not acc.token_generated_at or not acc.access_token_enc:
-        return False
-    if acc.broker == "groww":
-        # Groww's TOTP-generated access token is documented as never expiring (see
-        # groww_auth.py) - once logged in, it stays "fresh" indefinitely instead of needing a
-        # same-day check the way Zerodha/Angel/Kotak all do, so this deliberately skips the
-        # date comparison below for this one broker.
-        return True
-    return acc.token_generated_at.date() == datetime.datetime.utcnow().date()
-
-
 def _to_out(acc: models.Account) -> dict:
     return {
         "id": acc.id,
@@ -257,7 +262,7 @@ def _to_out(acc: models.Account) -> dict:
         "multiplier_override": acc.multiplier_override,
         "active": acc.active,
         "token_generated_at": acc.token_generated_at,
-        "has_token_today": _token_is_fresh(acc),
+        "has_token_today": token_is_fresh(acc),
     }
 
 
@@ -433,7 +438,7 @@ def toggle_active(account_id: int, db: Session = Depends(get_db)):
     acc.active = not acc.active
     db.commit()
     if acc.role == "master":
-        if acc.active and _token_is_fresh(acc):
+        if acc.active and token_is_fresh(acc):
             start_master_listener(acc.id, broadcast=broadcast)
         else:
             stop_master_listener(acc.id)
@@ -600,7 +605,7 @@ def manual_token(account_id: int, payload: ManualTokenIn, db: Session = Depends(
 def logout(account_id: int, db: Session = Depends(get_db)):
     """Clears the stored access token so the account goes back to NO TOKEN and needs a fresh
     Auto-login/manual token before trading again. Mainly useful for Groww/Angel, whose tokens
-    don't expire on their own the way Zerodha/Kotak's daily tokens do - see _token_is_fresh."""
+    don't expire on their own the way Zerodha/Kotak's daily tokens do - see pnl.token_is_fresh."""
     acc = db.query(models.Account).get(account_id)
     if not acc:
         raise HTTPException(404, "not found")
@@ -615,7 +620,7 @@ def refresh_capital(account_id: int, db: Session = Depends(get_db)):
     acc = db.query(models.Account).get(account_id)
     if not acc:
         raise HTTPException(404, "not found")
-    if not _token_is_fresh(acc):
+    if not token_is_fresh(acc):
         raise HTTPException(400, "No valid token for today - log in first.")
     _refresh_capital(acc, db)
     return _to_out(acc)
@@ -672,7 +677,7 @@ def exit_positions(account_id: int, db: Session = Depends(get_db)):
     acc = db.query(models.Account).get(account_id)
     if not acc:
         raise HTTPException(404, "not found")
-    if not _token_is_fresh(acc):
+    if not token_is_fresh(acc):
         raise HTTPException(400, "No valid token for today - log in first.")
     results = exit_account(db, acc, broadcast=broadcast)
     return {"results": results}
@@ -688,7 +693,7 @@ def get_positions(account_id: int, db: Session = Depends(get_db)):
     acc = db.query(models.Account).get(account_id)
     if not acc:
         raise HTTPException(404, "not found")
-    if not _token_is_fresh(acc):
+    if not token_is_fresh(acc):
         return []
     try:
         if acc.broker == "kotak_neo":
@@ -753,34 +758,7 @@ def get_logs(limit: int = 100, db: Session = Depends(get_db)):
 
 @app.get("/pnl")
 def get_pnl(db: Session = Depends(get_db)):
-    """Live running P&L per account, pulled from open positions. Kotak Neo's and Groww's
-    figures are best-effort (see kotak_client.get_pnl / groww_client.get_pnl) since neither
-    positions API returns a ready-made live-LTP PnL the way Kite's does - both sum realized
-    P&L only. Angel One's (see angel_client.get_pnl) is summed from its own documented "pnl"
-    field."""
-    accounts = db.query(models.Account).all()
-    out = []
-    total = 0.0
-    for acc in accounts:
-        pnl = None
-        if _token_is_fresh(acc):
-            try:
-                if acc.broker == "kotak_neo":
-                    pnl = kotak_client.get_pnl(acc)
-                elif acc.broker == "angel_one":
-                    pnl = angel_client.get_pnl(acc)
-                elif acc.broker == "groww":
-                    pnl = groww_client.get_pnl(acc)
-                else:
-                    kite = get_kite_client(crypto_utils.decrypt(acc.api_key_enc), crypto_utils.decrypt(acc.access_token_enc))
-                    positions = kite.positions()
-                    pnl = sum(p.get("pnl", 0.0) for p in positions.get("net", []))
-            except Exception:
-                pnl = None
-        out.append({"id": acc.id, "role": acc.role, "pnl": pnl})
-        if pnl is not None:
-            total += pnl
-    return {"accounts": out, "total": total}
+    return compute_pnl(db)
 
 
 # ---------------------------- Index ticker ----------------------------
@@ -807,7 +785,7 @@ def get_ticker(db: Session = Depends(get_db)):
 
     acc = next(
         (a for a in db.query(models.Account).order_by(models.Account.role.desc()).all()
-         if a.broker == "zerodha" and _token_is_fresh(a)),
+         if a.broker == "zerodha" and token_is_fresh(a)),
         None,
     )
     if not acc:
@@ -841,6 +819,34 @@ def get_ticker(db: Session = Depends(get_db)):
 def status(db: Session = Depends(get_db)):
     masters = db.query(models.Account).filter(models.Account.role == "master").all()
     return {"masters": [{"id": m.id, "label": m.label, "listening": is_running(m.id)} for m in masters]}
+
+
+_ip_cache = {"ip": None, "at": None}
+
+
+@app.get("/system/ip")
+def get_public_ip(force: bool = False):
+    """
+    The server's outbound public IPv4 - the address to whitelist with brokers like Kotak Neo
+    that require it (kotak_auth.py forces IPv4-egress process-wide, so this matches what
+    actually leaves the box). Cached briefly to avoid hammering the external lookup service on
+    every dashboard poll, but short enough that a network change (new WiFi, VPN toggle) shows up
+    quickly; ?force=true bypasses the cache entirely for an explicit manual refresh.
+    """
+    now = datetime.datetime.utcnow()
+    if not force and _ip_cache["ip"] and (now - _ip_cache["at"]).total_seconds() < 30:
+        return {"ip": _ip_cache["ip"]}
+    try:
+        resp = requests.get("https://api.ipify.org?format=json", timeout=5)
+        resp.raise_for_status()
+        ip = resp.json()["ip"]
+        _ip_cache["ip"] = ip
+        _ip_cache["at"] = now
+        return {"ip": ip}
+    except Exception:
+        if _ip_cache["ip"]:
+            return {"ip": _ip_cache["ip"]}
+        raise HTTPException(status_code=502, detail="Could not determine public IP")
 
 
 @app.get("/")

@@ -57,7 +57,7 @@ def _mark_own_order(order_id) -> None:
 _NON_ZERODHA_PLACERS = {
     "kotak_neo": (kotak_client.place_child_order, "Order placed on Kotak Neo (market protection)"),
     "angel_one": (angel_client.place_child_order, "Order placed on Angel One (market protection)"),
-    "groww": (groww_client.place_child_order, "Order placed on Groww (MARKET)"),
+    "groww": (groww_client.place_child_order, "Order placed on Groww (market protection)"),
 }
 
 
@@ -734,7 +734,7 @@ def exit_account(db: Session, account: models.Account, broadcast=None) -> list:
     return results
 
 
-MARKET_PROTECTION_PCT = 0.5  # % buffer around LTP so the LIMIT order fills like a market order
+MARKET_PROTECTION_PCT = 5  # % buffer around LTP so the LIMIT order fills like a market order
 
 
 def _protected_limit_price(kite, exchange: str, tradingsymbol: str, transaction_type: str) -> float:

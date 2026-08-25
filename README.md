@@ -73,24 +73,26 @@ deleting it.
 
 **Zerodha children**: Kite Connect rejects plain MARKET orders placed via the API ("market orders
 without market protection are not allowed"), and there's no API parameter to enable protection
-directly. To work around this, replicated orders are placed as **LIMIT** orders priced a 0.5%
+directly. To work around this, replicated orders are placed as **LIMIT** orders priced a 5%
 buffer beyond the current LTP in the trade's direction (`_protected_limit_price` in
 `backend/replication_engine.py`) — this fills immediately like a market order under normal
 liquidity while capping slippage. The buffer is controlled by `MARKET_PROTECTION_PCT` in that file.
 
 **Kotak Neo children**: Kotak's API natively supports market-protected market orders via a
-`market_protection` parameter, so these are placed as `MKT` orders with that set (same 0.5%
+`market_protection` parameter, so these are placed as `MKT` orders with that set (same 5%
 default, `MARKET_PROTECTION_PCT` in `backend/kotak_client.py`) rather than needing the LIMIT-price
 workaround.
 
 **Angel One children**: whether Angel's SmartAPI rejects a plain MARKET order the way Kite's does
 isn't verified from here, so these use the same protected-LIMIT-price workaround as Zerodha
-children (same 0.5% default, `MARKET_PROTECTION_PCT` in `backend/angel_client.py`) rather than
+children (same 5% default, `MARKET_PROTECTION_PCT` in `backend/angel_client.py`) rather than
 risk placing an unprotected order.
 
 **Groww children**: Groww's SDK documents `ORDER_TYPE_MARKET` as a first-class order type (unlike
-Kite, it doesn't reject a plain MARKET order), so these are placed as real MARKET orders with no
-protection workaround needed — unverified against a live account yet.
+Kite, it doesn't reject a plain MARKET order), but a real MARKET order has no slippage cap, and on
+a fast-moving option leg that made fills unpredictable enough to contribute to margin shortfalls
+on the next leg. These now use the same protected-LIMIT-price technique as the other three
+brokers (same 5% default, `MARKET_PROTECTION_PCT` in `backend/groww_client.py`).
 
 Product type mirrors the master order (defaults to MIS if unspecified) for all four brokers.
 

@@ -35,7 +35,7 @@ import crypto_utils
 from angel_auth import get_angel_client
 from trade_log import log_trade_event
 
-MARKET_PROTECTION_PCT = 0.5  # matches replication_engine's and kotak_client's Zerodha/Kotak buffer
+MARKET_PROTECTION_PCT = 5  # matches replication_engine's and kotak_client's Zerodha/Kotak buffer
 
 _EXCHANGE = {"NSE": "NSE", "BSE": "BSE", "NFO": "NFO", "BFO": "BFO", "MCX": "MCX", "CDS": "CDS"}
 _TRANSACTION_TYPE = {"BUY": "BUY", "SELL": "SELL"}
@@ -303,6 +303,29 @@ def get_profile_name(account) -> str:
     return data.get("name") or "" if isinstance(data, dict) else ""
 
 
+def _position_rows(client) -> list:
+    """Angel's position() call shares the same tightly-rate-limited API as generateSession (see
+    module docstring) and, confirmed live, intermittently comes back empty/malformed under
+    completely normal polling load - the dashboard's Positions panel would show real positions
+    one refresh and "No positions today" the next for the exact same account state, with no
+    error surfaced either way. One short retry clears it almost every time, so this is tried
+    before giving up and letting the caller fall back to its own empty-result default."""
+    last_exc = None
+    for attempt in range(2):
+        try:
+            resp = client.position()
+            rows = (resp or {}).get("data") if isinstance(resp, dict) else resp
+            if isinstance(rows, list):
+                return rows
+        except Exception as e:  # noqa: BLE001 - retried below; only re-raised after the retry too
+            last_exc = e
+        if attempt == 0:
+            time.sleep(1)
+    if last_exc:
+        raise last_exc
+    return []
+
+
 def get_positions(account) -> list:
     """Open and closed (squared-off today) positions for the dashboard's positions panel,
     mapped to the same shape main.py's Zerodha/Kotak paths return. Unlike Kotak, Angel's
@@ -310,10 +333,7 @@ def get_positions(account) -> list:
     docstring for the caveat that this hasn't been checked against a live account."""
     try:
         client = _client_for(account)
-        resp = client.position()
-        rows = (resp or {}).get("data") if isinstance(resp, dict) else resp
-        if not isinstance(rows, list):
-            return []
+        rows = _position_rows(client)
         out = []
         for p in rows:
             net_qty = int(float(p.get("netqty", 0) or 0))
@@ -338,10 +358,7 @@ def get_pnl(account):
     than risk a wrong number."""
     try:
         client = _client_for(account)
-        resp = client.position()
-        rows = (resp or {}).get("data") if isinstance(resp, dict) else resp
-        if not isinstance(rows, list):
-            return None
+        rows = _position_rows(client)
         return sum(float(p.get("pnl", 0) or 0) for p in rows)
     except Exception:  # noqa: BLE001
         return None
