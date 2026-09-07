@@ -12,9 +12,15 @@ cryptography==42.0.8
 # Kotak Neo broker support. Installed from git since it's not on PyPI:
 #   pip install "git+https://github.com/Kotak-Neo/Kotak-neo-api-v2.git@v2.0.2#egg=neo_api_client"
 # NOTE: neo_api_client's setup pins websockets==8.1 (for its own live-feed subscribe() feature,
-# which this app doesn't use), and installing it will downgrade the websockets pin above unless
-# you reinstall websockets==12.0 afterward - FastAPI/uvicorn's own /ws/live endpoint needs the
-# newer version. Always run `pip install websockets==12.0` again right after installing neo_api_client.
+# which this app doesn't use), conflicting with the websockets==12.0 pin above (FastAPI/uvicorn's
+# own /ws/live endpoint needs the newer version). A plain `pip install -r requirements.txt` in
+# one shot fails outright on any reasonably current pip with "ResolutionImpossible" - it won't
+# silently pick one and let you fix it after like older pip versions did. Confirmed live,
+# 2026-09: install everything else first, then neo_api_client on its own (letting it downgrade
+# websockets), then re-pin websockets back up - three separate pip invocations, e.g.:
+#   pip install -r <(grep -v neo_api_client requirements.txt | grep -v '^#')
+#   pip install "git+https://github.com/Kotak-Neo/Kotak-neo-api-v2.git@v2.0.2#egg=neo_api_client"
+#   pip install websockets==12.0
 neo_api_client @ git+https://github.com/Kotak-Neo/Kotak-neo-api-v2.git@v2.0.2#egg=neo_api_client
 
 # Angel One (SmartAPI) broker support - unlike Kotak Neo's SDK, this one is on PyPI.
