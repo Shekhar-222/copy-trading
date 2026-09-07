@@ -14,7 +14,16 @@ token refresh the way Kite does.
 import socket
 import pyotp
 import urllib3.util.connection as _urllib3_connection
-from neo_api_client import NeoAPI
+
+try:
+    from neo_api_client import NeoAPI
+except ImportError:
+    # neo_api_client pins several old exact dependency versions (pandas==2.2.3 among them) that
+    # need a slow source compile on newer Python releases and aren't required at all for anyone
+    # not using a Kotak Neo account - optional here so a server without it installed can still
+    # run every other broker instead of failing to start at all. get_kotak_client() below raises
+    # a clear error if actually called without the real package present.
+    NeoAPI = None
 
 # Kotak Neo's static-IP whitelist for order placement only supports IPv4 ("IPv6 support
 # coming soon" per their docs). On a dual-stack machine, Python/urllib3 (which both
@@ -57,6 +66,11 @@ def get_kotak_client(consumer_key: str, mobile_number: str, ucc: str, totp_secre
     The totp_login response (which carries the account's greeting name) is stashed on the
     client as `copytrader_login_response` so callers that need it (see
     kotak_client.get_profile_name) don't have to make a separate call for it."""
+    if NeoAPI is None:
+        raise KotakLoginError(
+            "Kotak Neo support isn't installed on this server (the 'neo_api_client' package is "
+            "missing) - install it to use Kotak Neo accounts."
+        )
     # neo_fin_key defaults to "neotradeapi" per Kotak's docs, but that default only applies when
     # the argument is omitted - passing neo_fin_key=None (as Kotak's own quickstart example
     # literally shows) overrides it with a real None instead. If that key is used as an auth
