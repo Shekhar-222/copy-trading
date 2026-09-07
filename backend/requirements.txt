@@ -6,7 +6,12 @@ sqlalchemy==2.0.30
 python-dotenv==1.0.0
 requests==2.32.3
 websockets==12.0
-pydantic==2.10.2  # growwapi>=1.5.0 requires >=2.10.2; fastapi==0.111.0 accepts it fine too
+pydantic==2.13.5  # growwapi>=1.5.0 requires >=2.10.2; fastapi==0.111.0 accepts it fine too.
+# Pinned at 2.13.5 specifically (not the 2.10.2 floor) because pydantic-core has no pre-built
+# wheel for Python 3.14 below this - anything older tries to compile from source via Rust/PyO3,
+# which fails outright ("configured Python interpreter version (3.14) is newer than PyO3's
+# maximum supported version") since PyO3 hadn't added 3.14 support yet at that pydantic-core
+# release. Confirmed live, 2026-09, deploying to a fresh Python-3.14 Ubuntu server.
 cryptography==42.0.8
 
 # Kotak Neo broker support. Installed from git since it's not on PyPI:
