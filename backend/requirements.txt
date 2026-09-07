@@ -2,7 +2,10 @@ fastapi==0.111.0
 uvicorn[standard]==0.30.1
 kiteconnect==5.0.1
 pyotp==2.9.0
-sqlalchemy==2.0.30
+sqlalchemy==2.0.52  # 2.0.30 crashes importing on Python 3.14 ("Can't replace canonical symbol
+# for '__firstlineno__'") - an internal conflict with a new Python 3.13+ class attribute that
+# didn't exist when 2.0.30 was released. 2.0.52 has this fixed. Confirmed live, 2026-09,
+# deploying to a fresh Python-3.14 Ubuntu server.
 python-dotenv==1.0.0
 requests==2.32.3
 websockets==12.0
