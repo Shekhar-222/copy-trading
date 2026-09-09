@@ -15,6 +15,7 @@ import time
 import requests
 
 import models
+import trade_log
 from database import SessionLocal
 from pnl import compute_pnl
 
@@ -27,16 +28,29 @@ _INTERVAL_SECONDS = 60
 # NSE/BSE cash+F&O close - matches when this app's own market-protection order placement stops
 # making sense too. Manual offset (not zoneinfo) to match the rest of the codebase's IST handling
 # (see trade_log.today_ist_start_utc).
-_MARKET_CLOSE_IST = datetime.time(15, 30)
+_NSE_CLOSE_IST = datetime.time(15, 30)
+# MCX (commodity) trades well past NSE's close - evening session runs until ~23:30 IST. Only
+# used as today's cutoff if an MCX trade actually happened today (see _market_close_ist), so a
+# normal NSE-only day doesn't keep sending digests for 8 pointless extra hours.
+_MCX_CLOSE_IST = datetime.time(23, 30)
 
 _lock = threading.Lock()
 _running = False
 _last_log_id_sent = 0
 
 
-def _past_market_close() -> bool:
+def _market_close_ist(db) -> datetime.time:
+    has_mcx_today = (
+        db.query(models.TradeLog)
+        .filter(models.TradeLog.timestamp >= trade_log.today_ist_start_utc(), models.TradeLog.exchange == "MCX")
+        .first()
+    )
+    return _MCX_CLOSE_IST if has_mcx_today else _NSE_CLOSE_IST
+
+
+def _past_market_close(db) -> bool:
     ist_now = datetime.datetime.utcnow() + datetime.timedelta(hours=5, minutes=30)
-    return ist_now.time() >= _MARKET_CLOSE_IST
+    return ist_now.time() >= _market_close_ist(db)
 
 
 def _send(text: str) -> None:
@@ -100,13 +114,13 @@ def _format_digest(db) -> str:
 def _loop() -> None:
     global _running
     while True:
-        if _past_market_close():
-            _send("Market closed for the day - pausing updates.")
-            with _lock:
-                _running = False
-            return  # thread ends here; ensure_running() re-arms a fresh one on tomorrow's first order
         db = SessionLocal()
         try:
+            if _past_market_close(db):
+                _send("Market closed for the day - pausing updates.")
+                with _lock:
+                    _running = False
+                return  # thread ends here; ensure_running() re-arms a fresh one on tomorrow's first order
             _send(_format_digest(db))
         except Exception:  # noqa: BLE001 - never let a bad cycle kill the loop
             pass
