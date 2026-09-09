@@ -131,8 +131,14 @@ _STOPLOSS_ORDER_TYPES = {"SL", "SL-M"}
 _MIRRORABLE_ORDER_TYPES = {"LIMIT"} | _STOPLOSS_ORDER_TYPES
 
 # Exchanges copy-trading is turned off for right now - master orders on these are never
-# mirrored to any child, regardless of order type or capital/multiplier settings.
-_DISABLED_EXCHANGES = {"MCX"}
+# mirrored to any child, regardless of order type or capital/multiplier settings. Empty for
+# now: MCX (commodity) was gated here until enabled - every broker client already has its
+# MCX exchange mapping wired up (angel_client._EXCHANGE, groww_client._EXCHANGE/_SEGMENT,
+# kotak_client._EXCHANGE_SEGMENT), and lot size/tick size lookups are exchange-generic, not
+# NFO-specific - so lifting the gate was the only change needed. Unlike Angel/Groww/Kotak's
+# equity/index-F&O paths, this hasn't been exercised against a real MCX order yet - watch the
+# first live one closely, per this project's track record of live-only broker surprises.
+_DISABLED_EXCHANGES = set()
 
 
 def replicate_order(db: Session, master_account: models.Account, order: dict, broadcast=None):
