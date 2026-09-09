@@ -53,17 +53,28 @@ def _send(text: str) -> None:
             pass          # recipient failing (e.g. bot removed from the channel) shouldn't stop the rest
 
 
+_SEPARATOR = "—" * 16
+
+
 def _format_digest(db) -> str:
     global _last_log_id_sent
 
     pnl = compute_pnl(db)
-    labels = {a.id: a.label for a in db.query(models.Account).all()}
+    accounts = {a.id: a for a in db.query(models.Account).all()}
 
-    lines = ["<b>P&L update</b>"]
+    # "Available fund" is account.capital - each broker's own margin figure, refreshed on
+    # login/manual refresh (see main.py's _refresh_capital) - not a fresh call here, since
+    # polling every broker's margin API every 60s would add real load for no benefit (and Angel
+    # One in particular is already known to rate-limit under much lighter polling than that).
+    lines = ["<b>P&L Update</b>", _SEPARATOR]
     for row in pnl["accounts"]:
-        label = labels.get(row["id"], f"#{row['id']}")
+        acc = accounts.get(row["id"])
+        label = acc.label if acc else f"#{row['id']}"
         value = f"{row['pnl']:.2f}" if row["pnl"] is not None else "-"
+        fund = f"{acc.capital:.2f}" if acc and acc.capital is not None else "-"
         lines.append(f"{label}: {value}")
+        lines.append(f"Available fund: {fund}")
+        lines.append(_SEPARATOR)
     lines.append(f"<b>Total: {pnl['total']:.2f}</b>")
 
     new_logs = (
@@ -76,7 +87,7 @@ def _format_digest(db) -> str:
         lines.append("")
         lines.append("<b>Trades</b>")
         for log in new_logs:
-            child = labels.get(log.child_account_id, "?")
+            child = accounts[log.child_account_id].label if log.child_account_id in accounts else "?"
             lines.append(
                 f"{log.status}: {child} {log.transaction_type} {log.replicated_quantity} "
                 f"{log.tradingsymbol} - {log.message}"
