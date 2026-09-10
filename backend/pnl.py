@@ -25,6 +25,42 @@ def token_is_fresh(acc: "models.Account") -> bool:
     return acc.token_generated_at.date() == datetime.datetime.utcnow().date()
 
 
+def compute_available_margin(db) -> dict:
+    """Live *available* (free) margin per account - what's actually left to trade with right
+    now, after open positions have locked up margin - keyed by account id. This is NOT
+    account.capital, which is a start-of-day snapshot taken at login and left fixed (it's the
+    basis for proportional position sizing, so it deliberately doesn't move intraday).
+
+    Every broker's get_margin() already returns the net-of-utilised figure; Kite's is fetched
+    inline here and sums the equity + commodity segment pools so an MCX position's margin
+    usage shows up too. Best-effort per account: a failed or rate-limited fetch yields None
+    (rendered as "-") instead of blocking the rest, same posture as compute_pnl."""
+    out = {}
+    for acc in db.query(models.Account).all():
+        margin = None
+        if token_is_fresh(acc):
+            try:
+                if acc.broker == "kotak_neo":
+                    margin = kotak_client.get_margin(acc)
+                elif acc.broker == "angel_one":
+                    margin = angel_client.get_margin(acc)
+                elif acc.broker == "groww":
+                    margin = groww_client.get_margin(acc)
+                else:
+                    kite = get_kite_client(
+                        crypto_utils.decrypt(acc.api_key_enc), crypto_utils.decrypt(acc.access_token_enc)
+                    )
+                    m = kite.margins()
+                    margin = sum(
+                        float((m.get(seg) or {}).get("net", 0.0) or 0.0)
+                        for seg in ("equity", "commodity")
+                    )
+            except Exception:  # noqa: BLE001 - a bad fetch shows "-" for that account, nothing more
+                margin = None
+        out[acc.id] = margin
+    return out
+
+
 def compute_pnl(db) -> dict:
     """Live running P&L per account, pulled from open positions. Kotak Neo's and Groww's
     figures are best-effort (see kotak_client.get_pnl / groww_client.get_pnl) since neither

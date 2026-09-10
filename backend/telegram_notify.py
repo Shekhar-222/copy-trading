@@ -17,7 +17,7 @@ import requests
 import models
 import trade_log
 from database import SessionLocal
-from pnl import compute_pnl
+from pnl import compute_pnl, compute_available_margin
 
 _BOT_TOKEN = os.getenv("TELEGRAM_BOT_TOKEN")
 # Comma-separated so the same digest can go to more than one place at once - e.g. your own DM
@@ -74,18 +74,18 @@ def _format_digest(db) -> str:
     global _last_log_id_sent
 
     pnl = compute_pnl(db)
+    # Live free margin per account, fetched fresh here (not the start-of-day account.capital
+    # snapshot) so it reflects margin locked up by positions opened during the session.
+    margins = compute_available_margin(db)
     accounts = {a.id: a for a in db.query(models.Account).all()}
 
-    # "Available fund" is account.capital - each broker's own margin figure, refreshed on
-    # login/manual refresh (see main.py's _refresh_capital) - not a fresh call here, since
-    # polling every broker's margin API every 60s would add real load for no benefit (and Angel
-    # One in particular is already known to rate-limit under much lighter polling than that).
     lines = ["<b>P&L Update</b>", _SEPARATOR]
     for row in pnl["accounts"]:
         acc = accounts.get(row["id"])
         label = acc.label if acc else f"#{row['id']}"
         value = f"{row['pnl']:.2f}" if row["pnl"] is not None else "-"
-        fund = f"{acc.capital:.2f}" if acc and acc.capital is not None else "-"
+        margin = margins.get(row["id"])
+        fund = f"{margin:.2f}" if margin is not None else "-"
         lines.append(f"{label}: {value}")
         lines.append(f"Available fund: {fund}")
         lines.append(_SEPARATOR)
