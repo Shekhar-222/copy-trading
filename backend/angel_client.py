@@ -206,9 +206,25 @@ def place_child_order(account, exchange: str, tradingsymbol: str, transaction_ty
 
     client = _client_for(account)
     if instrument is not None:
-        angel_symbol, symboltoken, _lot_size = _resolve_fo(exchange_segment, instrument)
+        angel_symbol, symboltoken, lot_size = _resolve_fo(exchange_segment, instrument)
     else:
-        angel_symbol, symboltoken, _lot_size = _resolve_equity(exchange_segment, tradingsymbol)
+        angel_symbol, symboltoken, lot_size = _resolve_equity(exchange_segment, tradingsymbol)
+
+    if lot_size and quantity % lot_size != 0:
+        # quantity is computed upstream in replication_engine.py from the MASTER's (Kite) lot
+        # size, shared across every child - normally correct since exchanges set lot sizes
+        # centrally, not brokers, but Kite's instrument data can be stale for a given contract
+        # (confirmed live, 2026-09, for an MCX contract: Kite reported lot_size=1 while the real
+        # exchange-mandated lot size was 10, matching what Kotak Neo's own live resolution
+        # returned). Same mismatch risk applies here - fail loudly with the real numbers instead
+        # of risking a silently mis-sized order.
+        raise ValueError(
+            f"Angel One's own lot size for {angel_symbol} is {lot_size}, but was asked to place "
+            f"{quantity} - not a whole multiple. This usually means Kite's instrument data has a "
+            f"stale/incorrect lot size for this contract (quantity is computed from Kite's lot "
+            f"size and shared across every child) - worth checking whether other children's "
+            f"actual fills for this contract are sized correctly too."
+        )
 
     angel_txn_type = _TRANSACTION_TYPE.get(transaction_type, transaction_type)
     limit_price = _protected_limit_price(client, exchange_segment, angel_symbol, symboltoken, angel_txn_type)
