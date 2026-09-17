@@ -310,7 +310,7 @@ def _replicate_fill(db: Session, master_account: models.Account, order: dict, br
     tradingsymbol = order.get("tradingsymbol", "")
     transaction_type = order.get("transaction_type")
     instrument = _get_instrument_detail(master_kite, exchange, tradingsymbol)
-    lot_size, master_quantity = _resolve_lot_size_and_quantity(db, exchange, tradingsymbol, instrument, order)
+    lot_size = order.get("lot_size") or (instrument or {}).get("lot_size") or _guess_lot_size(tradingsymbol)
     freeze_qty = _freeze_quantity(exchange, tradingsymbol)
     product = order.get("product", "MIS")
     master_order_id = order.get("order_id")
@@ -319,7 +319,7 @@ def _replicate_fill(db: Session, master_account: models.Account, order: dict, br
         futures = []
         for child in children:
             qty = compute_child_quantity(
-                master_qty=master_quantity,
+                master_qty=order["quantity"],
                 master_capital=master_capital,
                 child_capital=child.capital or 0.0,
                 lot_size=lot_size,
@@ -330,7 +330,7 @@ def _replicate_fill(db: Session, master_account: models.Account, order: dict, br
                 log_trade_event(
                     db, child, exchange, tradingsymbol, transaction_type, qty, "SKIPPED",
                     "Computed replicated quantity was 0 (child capital too small for one lot).",
-                    broadcast, master_order_id=master_order_id, master_quantity=master_quantity,
+                    broadcast, master_order_id=master_order_id, master_quantity=order["quantity"],
                 )
                 continue
 
@@ -518,16 +518,14 @@ def _handle_order_lifecycle(db: Session, master_account: models.Account, order: 
                 access_token=crypto_utils.decrypt(master_account.access_token_enc),
             )
             fill_instrument = _get_instrument_detail(master_kite, exchange, tradingsymbol)
-            fill_lot_size, fill_master_quantity = _resolve_lot_size_and_quantity(
-                db, exchange, tradingsymbol, fill_instrument, order,
-            )
+            fill_lot_size = order.get("lot_size") or (fill_instrument or {}).get("lot_size") or _guess_lot_size(tradingsymbol)
             fill_freeze_qty = _freeze_quantity(exchange, tradingsymbol)
             fill_product = order.get("product", "MIS")
             with concurrent.futures.ThreadPoolExecutor(max_workers=_CHILD_REPLICATION_WORKERS) as pool:
                 futures = []
                 for child in unmirrored_children:
                     qty = compute_child_quantity(
-                        master_qty=fill_master_quantity, master_capital=master_account.capital or 0.0,
+                        master_qty=order.get("quantity", 0), master_capital=master_account.capital or 0.0,
                         child_capital=child.capital or 0.0, lot_size=fill_lot_size,
                         multiplier_override=child.multiplier_override,
                     )
@@ -535,7 +533,7 @@ def _handle_order_lifecycle(db: Session, master_account: models.Account, order: 
                         log_trade_event(
                             db, child, exchange, tradingsymbol, transaction_type, qty, "SKIPPED",
                             "Computed replicated quantity was 0 (child capital too small for one lot).",
-                            broadcast, master_order_id=master_order_id, master_quantity=fill_master_quantity,
+                            broadcast, master_order_id=master_order_id, master_quantity=order.get("quantity", 0),
                         )
                         continue
                     slices = _slice_quantity(qty, fill_lot_size, fill_freeze_qty)
@@ -566,7 +564,7 @@ def _handle_order_lifecycle(db: Session, master_account: models.Account, order: 
         access_token=crypto_utils.decrypt(master_account.access_token_enc),
     )
     instrument = _get_instrument_detail(master_kite, exchange, tradingsymbol)
-    lot_size, master_quantity = _resolve_lot_size_and_quantity(db, exchange, tradingsymbol, instrument, order)
+    lot_size = order.get("lot_size") or (instrument or {}).get("lot_size") or _guess_lot_size(tradingsymbol)
     freeze_qty = _freeze_quantity(exchange, tradingsymbol)
 
     if mirrors:
@@ -580,7 +578,7 @@ def _handle_order_lifecycle(db: Session, master_account: models.Account, order: 
             child = db.query(models.Account).get(child_id)
             child_mirrors = sorted(child_mirrors, key=lambda m: m.id)
             qty = compute_child_quantity(
-                master_qty=master_quantity, master_capital=master_capital,
+                master_qty=order.get("quantity", 0), master_capital=master_capital,
                 child_capital=child.capital or 0.0, lot_size=lot_size,
                 multiplier_override=child.multiplier_override,
             )
@@ -659,7 +657,7 @@ def _handle_order_lifecycle(db: Session, master_account: models.Account, order: 
     )
     for child in children:
         qty = compute_child_quantity(
-            master_qty=master_quantity, master_capital=master_capital,
+            master_qty=order.get("quantity", 0), master_capital=master_capital,
             child_capital=child.capital or 0.0, lot_size=lot_size,
             multiplier_override=child.multiplier_override,
         )
@@ -667,7 +665,7 @@ def _handle_order_lifecycle(db: Session, master_account: models.Account, order: 
             log_trade_event(
                 db, child, exchange, tradingsymbol, transaction_type, qty, "SKIPPED",
                 "Computed replicated quantity was 0 (child capital too small for one lot).",
-                broadcast, master_order_id=master_order_id, master_quantity=master_quantity,
+                broadcast, master_order_id=master_order_id, master_quantity=order.get("quantity", 0),
             )
             continue
 
@@ -878,85 +876,3 @@ def _guess_lot_size(tradingsymbol: str) -> int:
     if symbol.startswith("NIFTY"):
         return 65
     return 1
-
-
-def _find_real_mcx_lot_size(db: Session, exchange: str, instrument) -> int:
-    """Best-effort: ask another broker's own contract resolver for its lot size on the same MCX
-    contract, to check against Kite's. Tries Groww then Angel One first (both resolve against a
-    cached/static instrument list, no live broker login needed), then Kotak Neo last (needs a
-    live TOTP login just to check, only attempted if an active account exists) - cheapest first.
-    Returns None if nothing could be resolved; the caller treats that as "couldn't verify, trust
-    Kite's value" rather than blocking replication on it."""
-    if instrument is None:
-        return None
-
-    try:
-        groww_exchange = groww_client._EXCHANGE.get(exchange)
-        if groww_exchange:
-            _, _, lot_size, _ = groww_client._resolve_fo(groww_exchange, instrument)
-            if lot_size:
-                return lot_size
-    except Exception:  # noqa: BLE001 - best-effort only, never block on this
-        pass
-
-    try:
-        exchange_segment = angel_client._EXCHANGE.get(exchange)
-        if exchange_segment:
-            _, _, lot_size = angel_client._resolve_fo(exchange_segment, instrument)
-            if lot_size:
-                return lot_size
-    except Exception:  # noqa: BLE001
-        pass
-
-    try:
-        kotak_acc = (
-            db.query(models.Account)
-            .filter(models.Account.broker == "kotak_neo", models.Account.active == True)  # noqa: E712
-            .first()
-        )
-        if kotak_acc:
-            exchange_segment = kotak_client._EXCHANGE_SEGMENT.get(exchange)
-            if exchange_segment:
-                client = kotak_client._client_for(kotak_acc)
-                _, lot_size = kotak_client._resolve_fo(client, exchange_segment, instrument)
-                if lot_size:
-                    return lot_size
-    except Exception:  # noqa: BLE001
-        pass
-
-    return None
-
-
-def _resolve_lot_size_and_quantity(db: Session, exchange: str, tradingsymbol: str, instrument,
-                                    order: dict) -> tuple:
-    """Returns (lot_size, quantity) - the lot size and absolute quantity to use as the shared
-    sizing basis for EVERY child, Zerodha included, not just Kotak/Angel/Groww.
-
-    Kite's own reported lot size is trusted everywhere EXCEPT MCX, where a lot size of exactly 1
-    is implausible for a real F&O/commodity contract (equity CASH lot_size=1 is completely
-    normal; MCX contracts never actually have one) - confirmed live, 2026-09: for a CRUDEOILM
-    contract, Kite reported lot_size=1 while the real exchange-mandated lot size is 10 (matching
-    what Kotak/Angel/Groww each independently resolved, and MCX's own published contract spec).
-    The master's own order `quantity` turned out to be reported in LOTS rather than absolute
-    units for this contract - confirmed directly by the account holder ("12 is showing because I
-    took 12 lots") matching the exact number Kite reports - because Kite's own broken lot_size
-    metadata makes it treat "lots entered" and "absolute quantity" as the same number throughout
-    its own systems. When detected, this scales order['quantity'] up to the real absolute
-    quantity using another broker's independently-resolved lot size, so every child's
-    proportional sizing (including Zerodha children, who were silently trading ~10x too small on
-    this exact contract before this fix) is based on the corrected value.
-
-    Deliberately scoped to MCX only with exchange != "MCX" as the very first check - NSE/NFO/
-    BSE/BFO/CDS behavior is completely unchanged by this function, whatever Kite's lot_size says
-    there is returned as-is, same as before this existed."""
-    raw_lot_size = order.get("lot_size") or (instrument or {}).get("lot_size") or _guess_lot_size(tradingsymbol)
-    raw_quantity = order.get("quantity", 0)
-
-    if exchange != "MCX" or raw_lot_size != 1:
-        return raw_lot_size, raw_quantity
-
-    real_lot_size = _find_real_mcx_lot_size(db, exchange, instrument)
-    if not real_lot_size or real_lot_size == raw_lot_size:
-        return raw_lot_size, raw_quantity
-
-    return real_lot_size, raw_quantity * real_lot_size
