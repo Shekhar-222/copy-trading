@@ -60,6 +60,17 @@ class Account(Base):
     created_at = Column(DateTime, default=datetime.datetime.utcnow)
 
 
+class Setting(Base):
+    """Small generic key-value store for app-wide toggles that need to persist across restarts
+    (e.g. whether the Telegram digest is enabled) - not per-account, so doesn't belong on
+    Account. Absent key = default value, handled by each reader, so existing deployments don't
+    need a migration to seed rows."""
+    __tablename__ = "settings"
+
+    key = Column(String, primary_key=True)
+    value = Column(String, nullable=False)
+
+
 class MirroredOrder(Base):
     """Tracks a LIMIT/SL/SL-M order mirrored onto a child's own book while it's still resting
     on the master's (see replication_engine._handle_order_lifecycle) - so a later order-update

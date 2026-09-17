@@ -98,6 +98,50 @@ body {
   font-weight: 600;
 }
 
+.telegram-toggle {
+  display: flex;
+  align-items: center;
+  gap: 7px;
+  padding: 5px 12px;
+  border-radius: 999px;
+  border: 1px solid var(--border);
+  background: var(--bg-panel-raised);
+  color: var(--text-muted);
+  font-size: 12px;
+  font-family: var(--font-mono);
+  font-weight: 600;
+  cursor: pointer;
+}
+
+.telegram-toggle:disabled {
+  cursor: default;
+  opacity: 0.6;
+}
+
+.telegram-toggle .telegram-toggle-dot {
+  width: 7px;
+  height: 7px;
+  border-radius: 50%;
+  background: var(--text-muted);
+}
+
+.telegram-toggle.on {
+  color: var(--teal);
+  border-color: rgba(62, 207, 142, 0.4);
+}
+.telegram-toggle.on .telegram-toggle-dot {
+  background: var(--teal);
+  box-shadow: 0 0 6px var(--teal);
+}
+
+.telegram-toggle.off {
+  color: var(--coral);
+  border-color: rgba(240, 85, 76, 0.35);
+}
+.telegram-toggle.off .telegram-toggle-dot {
+  background: var(--coral);
+}
+
 .ip-change-toast {
   position: fixed;
   top: 16px;

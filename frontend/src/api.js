@@ -58,6 +58,8 @@ export const api = {
   getStatus: () => request('/status'),
   getPublicIp: (force) => request(`/system/ip${force ? '?force=true' : ''}`),
   getPnl: () => request('/pnl'),
+  getTelegramStatus: () => request('/telegram/status'),
+  setTelegramEnabled: (enabled) => request('/telegram/toggle', { method: 'POST', body: JSON.stringify({ enabled }) }),
   // Token is sent as the WebSocket's first message (see App.jsx), not a query param here -
   // a query param would end up in uvicorn's plaintext access log on every connection.
   wsUrl: () => BASE.replace('http', 'ws') + '/ws/live',

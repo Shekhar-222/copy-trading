@@ -29,6 +29,7 @@ from ticker_listener import start_master_listener, stop_master_listener, is_runn
 from replication_engine import exit_account
 from pnl import token_is_fresh, compute_pnl
 import trade_log
+import telegram_notify
 
 load_dotenv()
 Base.metadata.create_all(bind=engine)
@@ -247,6 +248,10 @@ class MultiplierIn(BaseModel):
 
 class RoleIn(BaseModel):
     role: str  # "master" or "child"
+
+
+class TelegramToggleIn(BaseModel):
+    enabled: bool
 
 
 # ---------------------------- Helpers ----------------------------
@@ -819,6 +824,17 @@ def get_ticker(db: Session = Depends(get_db)):
 def status(db: Session = Depends(get_db)):
     masters = db.query(models.Account).filter(models.Account.role == "master").all()
     return {"masters": [{"id": m.id, "label": m.label, "listening": is_running(m.id)} for m in masters]}
+
+
+@app.get("/telegram/status")
+def get_telegram_status(db: Session = Depends(get_db)):
+    return {"enabled": telegram_notify.is_enabled(db)}
+
+
+@app.post("/telegram/toggle")
+def set_telegram_status(payload: TelegramToggleIn, db: Session = Depends(get_db)):
+    telegram_notify.set_enabled(db, payload.enabled)
+    return {"enabled": payload.enabled}
 
 
 _ip_cache = {"ip": None, "at": None}

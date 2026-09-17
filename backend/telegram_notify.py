@@ -53,6 +53,28 @@ def _past_market_close(db) -> bool:
     return ist_now.time() >= _market_close_ist(db)
 
 
+_SETTING_KEY = "telegram_enabled"
+
+
+def is_enabled(db) -> bool:
+    """Manual on/off toggle for the digest, set via the dashboard's Start/Stop control (see
+    main.py's /telegram/status and /telegram/toggle). No stored row means nobody has touched
+    the toggle yet, which defaults to enabled - preserves the original always-on behavior for
+    any deployment that predates this setting."""
+    row = db.query(models.Setting).filter(models.Setting.key == _SETTING_KEY).first()
+    return row.value != "false" if row else True
+
+
+def set_enabled(db, enabled: bool) -> None:
+    row = db.query(models.Setting).filter(models.Setting.key == _SETTING_KEY).first()
+    value = "true" if enabled else "false"
+    if row:
+        row.value = value
+    else:
+        db.add(models.Setting(key=_SETTING_KEY, value=value))
+    db.commit()
+
+
 def _send(text: str) -> None:
     if not _BOT_TOKEN or not _CHAT_IDS:
         return
@@ -116,12 +138,20 @@ def _loop() -> None:
     while True:
         db = SessionLocal()
         try:
+            enabled = is_enabled(db)
             if _past_market_close(db):
-                _send("Market closed for the day - pausing updates.")
+                if enabled:
+                    _send("Market closed for the day - pausing updates.")
                 with _lock:
                     _running = False
                 return  # thread ends here; ensure_running() re-arms a fresh one on tomorrow's first order
-            _send(_format_digest(db))
+            if enabled:
+                # Not called at all while disabled - skips both the Telegram send and every
+                # broker P&L/margin call _format_digest would otherwise make, rather than
+                # computing a digest nobody receives. Keeps advancing _last_log_id_sent only
+                # when a digest is actually built, so re-enabling later reports the trades that
+                # happened while muted instead of silently dropping them.
+                _send(_format_digest(db))
         except Exception:  # noqa: BLE001 - never let a bad cycle kill the loop
             pass
         finally:

@@ -27,6 +27,8 @@ export default function App() {
   const [serverIp, setServerIp] = useState(null)
   const [ipCopied, setIpCopied] = useState(false)
   const [ipChangeNotice, setIpChangeNotice] = useState(null)
+  const [telegramEnabled, setTelegramEnabled] = useState(null)
+  const [telegramBusy, setTelegramBusy] = useState(false)
   const wsRef = useRef(null)
   const prevIpRef = useRef(null)
 
@@ -37,6 +39,23 @@ export default function App() {
     setStatus(s)
     setPnl(p)
   }, [])
+
+  useEffect(() => {
+    api.getTelegramStatus().then((r) => setTelegramEnabled(r.enabled)).catch(() => {})
+  }, [])
+
+  const handleToggleTelegram = async () => {
+    if (telegramEnabled === null || telegramBusy) return
+    setTelegramBusy(true)
+    try {
+      const r = await api.setTelegramEnabled(!telegramEnabled)
+      setTelegramEnabled(r.enabled)
+    } catch (e) {
+      alert(e.message)
+    } finally {
+      setTelegramBusy(false)
+    }
+  }
 
   useEffect(() => {
     load()
@@ -203,6 +222,17 @@ export default function App() {
               <span className="server-ip-value">{serverIp}</span>
               {ipCopied && <span>copied</span>}
             </span>
+          )}
+          {telegramEnabled !== null && (
+            <button
+              className={`telegram-toggle ${telegramEnabled ? 'on' : 'off'}`}
+              onClick={handleToggleTelegram}
+              disabled={telegramBusy}
+              title={telegramEnabled ? 'Telegram alerts are on - click to stop' : 'Telegram alerts are off - click to start'}
+            >
+              <span className="telegram-toggle-dot" />
+              Telegram {telegramEnabled ? 'ON' : 'OFF'}
+            </button>
           )}
           <PnlBadge label="Aggregate P&L" value={pnl.total} layout="pill" size="lg" />
         </div>
