@@ -255,6 +255,18 @@ def place_child_order(account, exchange: str, tradingsymbol: str, transaction_ty
     segment = _SEGMENT.get(exchange)
     if not groww_exchange or not segment:
         raise ValueError(f"Groww child accounts don't support exchange {exchange!r} yet.")
+    if segment == "COMMODITY":
+        # Confirmed against Groww's own API docs, 2026-09: their trading API currently supports
+        # only CASH (equity) and FNO segments - commodity (MCX) order placement isn't available
+        # via the API at all, even though MCX trading works fine on Groww's own app (manually
+        # confirmed live: an order placed by hand went through, the identical order via this
+        # API failed with Groww's own "Orders are currently not supported for commodity segment").
+        # Not something this app can work around - needs Groww to add API support. Fail with this
+        # clear explanation immediately instead of spending a round trip on Groww's generic error.
+        raise ValueError(
+            "Groww's trading API doesn't support commodity (MCX) order placement yet - this "
+            "works fine on Groww's own app, but not through the API this account trades via."
+        )
 
     client = _client_for(account)
     if instrument is not None:
