@@ -97,9 +97,27 @@ def place_child_order(account, exchange: str, tradingsymbol: str, transaction_ty
 
     client = _client_for(account)
     if instrument is not None:
-        kotak_symbol, _lot_size = _resolve_fo(client, exchange_segment, instrument)
+        kotak_symbol, lot_size = _resolve_fo(client, exchange_segment, instrument)
     else:
-        kotak_symbol, _lot_size = _resolve_equity(client, exchange_segment, tradingsymbol)
+        kotak_symbol, lot_size = _resolve_equity(client, exchange_segment, tradingsymbol)
+
+    if lot_size and quantity % lot_size != 0:
+        # quantity is computed upstream in replication_engine.py from the MASTER's (Kite)
+        # lot size, shared across every child - it's normally correct since exchanges set lot
+        # sizes centrally, not brokers, so Kite and Kotak should agree. When they don't, Kite's
+        # instrument data is the one that's stale/wrong (confirmed live, 2026-09: Kite reported
+        # lot_size=1 for a real MCX contract Kotak correctly resolved as lot_size=10, matching
+        # the same strike/expiry/type - not a wrong-contract mismatch, genuinely bad Kite data).
+        # Fail loudly with the real numbers instead of letting Kotak's API reject it with an
+        # opaque "please provide valid lotwise quantity" - and this same stale lot size was used
+        # for every OTHER child's quantity too, so a mismatch here is worth checking elsewhere.
+        raise ValueError(
+            f"Kotak Neo's own lot size for {kotak_symbol} is {lot_size}, but was asked to place "
+            f"{quantity} - not a whole multiple. This usually means Kite's instrument data has a "
+            f"stale/incorrect lot size for this contract (quantity is computed from Kite's lot "
+            f"size and shared across every child) - worth checking whether other children's "
+            f"actual fills for this contract are sized correctly too."
+        )
 
     resp = client.place_order(
         exchange_segment=exchange_segment,
