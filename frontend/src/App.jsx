@@ -231,7 +231,7 @@ export default function App() {
               title={telegramEnabled ? 'Telegram alerts are on - click to stop' : 'Telegram alerts are off - click to start'}
             >
               <span className="telegram-toggle-dot" />
-              Telegram {telegramEnabled ? 'ON' : 'OFF'}
+              Alert {telegramEnabled ? 'ON' : 'OFF'}
             </button>
           )}
           <PnlBadge label="Aggregate P&L" value={pnl.total} layout="pill" size="lg" />
