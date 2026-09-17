@@ -90,7 +90,15 @@ def _build_index(rows: list) -> tuple:
         segment = row.get("segment")
         if segment == "CASH":
             by_exch_symbol.setdefault((exch, str(row.get("trading_symbol", "")).upper()), row)
-        elif segment == "FNO":
+        elif segment in ("FNO", "COMMODITY"):
+            # MCX rows carry segment="COMMODITY", not "FNO" (confirmed live, 2026-09, against a
+            # real row: "COMMODITY | SILVERMIC30NOV26FUT | SILVERMIC") - matches this module's own
+            # _SEGMENT mapping used for order placement (MCX -> COMMODITY), but this index only
+            # ever checked for "FNO", so no MCX contract was ever resolvable via Groww at all,
+            # for any symbol - every MCX order failed with "Could not find a matching Groww
+            # contract" regardless of strike/expiry. Row structure (underlying_symbol,
+            # expiry_date, strike_price, instrument_type, lot_size, tick_size) is identical to
+            # the FNO rows, so no other change is needed beyond indexing them here too.
             key = (exch, str(row.get("underlying_symbol", "")).upper())
             by_exch_underlying.setdefault(key, []).append(row)
     return by_exch_symbol, by_exch_underlying
