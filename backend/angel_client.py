@@ -229,6 +229,16 @@ def place_child_order(account, exchange: str, tradingsymbol: str, transaction_ty
     angel_txn_type = _TRANSACTION_TYPE.get(transaction_type, transaction_type)
     limit_price = _protected_limit_price(client, exchange_segment, angel_symbol, symboltoken, angel_txn_type)
 
+    # Angel's placeOrder wants MCX quantity expressed in LOTS, not absolute units - unlike NFO/
+    # BFO equity F&O (where it wants absolute units, same as every other exchange/broker this app
+    # handles, including Kotak Neo/Groww's own MCX placement). Confirmed live, 2026-09: a real
+    # 2-lot CRUDEOILM order sent as quantity=20 (the correct absolute unit count, validated above
+    # as a clean multiple of the real lot size) was rejected for a margin requirement ~10x too
+    # high - consistent with Angel treating "20" as 20 lots rather than 20 real units. Scoped to
+    # MCX only via the exchange check below; NFO/BFO/NSE keep sending the absolute quantity
+    # exactly as before, unaffected.
+    angel_quantity = quantity // lot_size if exchange == "MCX" and lot_size else quantity
+
     resp = client.placeOrder({
         "variety": "NORMAL",
         "tradingsymbol": angel_symbol,
@@ -241,7 +251,7 @@ def place_child_order(account, exchange: str, tradingsymbol: str, transaction_ty
         "price": str(limit_price),
         "squareoff": "0",
         "stoploss": "0",
-        "quantity": str(quantity),
+        "quantity": str(angel_quantity),
     })
     # placeOrder's return shape isn't fully confirmed from here - the SDK is documented to
     # return either the order id directly or a {"status": True, "data": {"orderid": ...}}
