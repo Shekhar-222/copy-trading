@@ -250,9 +250,27 @@ def place_child_order(account, exchange: str, tradingsymbol: str, transaction_ty
 
     client = _client_for(account)
     if instrument is not None:
-        symbol, _token, _lot_size, tick_size = _resolve_fo(groww_exchange, instrument)
+        symbol, _token, lot_size, tick_size = _resolve_fo(groww_exchange, instrument)
     else:
-        symbol, _token, _lot_size, tick_size = _resolve_equity(groww_exchange, tradingsymbol)
+        symbol, _token, lot_size, tick_size = _resolve_equity(groww_exchange, tradingsymbol)
+
+    if lot_size and quantity % lot_size != 0:
+        # quantity is computed upstream in replication_engine.py from the MASTER's (Kite) lot
+        # size, shared across every child - normally correct since exchanges set lot sizes
+        # centrally, not brokers, but Kite's instrument data can be stale for a given contract
+        # (confirmed live, 2026-09, for an MCX contract: Kite reported lot_size=1 while the real
+        # exchange-mandated lot size was 10, matching what Kotak Neo's own live resolution
+        # returned). Same mismatch risk applies here - fail loudly with the real numbers instead
+        # of silently placing a wrongly-sized order (Groww's own API may not validate this as
+        # strictly as Kotak's does, which would otherwise let a mis-sized order through with no
+        # error at all).
+        raise ValueError(
+            f"Groww's own lot size for {symbol} is {lot_size}, but was asked to place {quantity} "
+            f"- not a whole multiple. This usually means Kite's instrument data has a stale/"
+            f"incorrect lot size for this contract (quantity is computed from Kite's lot size and "
+            f"shared across every child) - worth checking whether other children's actual fills "
+            f"for this contract are sized correctly too."
+        )
 
     groww_txn_type = _TRANSACTION_TYPE.get(transaction_type, transaction_type)
     limit_price = _protected_limit_price(client, groww_exchange, segment, symbol, tick_size, groww_txn_type)
