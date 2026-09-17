@@ -453,8 +453,11 @@ def _handle_order_lifecycle(db: Session, master_account: models.Account, order: 
     model (_replicate_fill) - so a child's own order book actually reflects the master's: a
     stoploss's protection or an AMO order's overnight queue position exists on the child too,
     not just after the master's already acted on it. Kotak Neo, Angel One, and Groww children
-    are skipped for now (see kotak_client.py / angel_client.py / groww_client.py headers) -
-    their place_child_order only knows how to submit an immediate market(-protected) order.
+    can't get a live resting order this way (see kotak_client.py / angel_client.py /
+    groww_client.py headers - their place_child_order only knows how to submit an immediate
+    market(-protected) order), so they're logged SKIPPED here instead and caught up separately
+    once the master's order actually completes (see the status == "COMPLETE" branch below,
+    which places their fill then, the same way _replicate_fill always has).
     """
     master_order_id = order.get("order_id")
     status = order.get("status")
@@ -487,11 +490,60 @@ def _handle_order_lifecycle(db: Session, master_account: models.Account, order: 
 
     if status == "COMPLETE":
         if not mirrors:
-            # No live mirror existed (e.g. this order was already resting before this feature
-            # shipped, or mirroring failed for every child) - fall back to the old
-            # fill-then-copy behaviour so the trade isn't silently dropped.
+            # No live mirror existed for anyone (e.g. this order was already resting before this
+            # feature shipped, or it filled before ever resting) - fall back to the old
+            # fill-then-copy behaviour for every child so the trade isn't silently dropped.
             _replicate_fill(db, master_account, order, broadcast)
             return
+
+        # Kotak Neo/Angel One/Groww children never get a live mirror at all (see the "no mirror
+        # yet" branch below - they're logged SKIPPED there with "copied once it fills" as the
+        # promise). Previously that promise was never kept: this loop only ever followed up on
+        # children that already had a mirror, so anyone skipped at the resting stage got no
+        # order at all once the master's order completed - confirmed live, 2026-09, orders
+        # missing entirely for Kotak Neo children while Zerodha children copied fine. Place
+        # their fill now, the same way _replicate_fill always has for a market/immediate order.
+        mirrored_child_ids = {m.child_account_id for m in mirrors}
+        unmirrored_children = (
+            db.query(models.Account)
+            .filter(models.Account.role == "child", models.Account.active == True,  # noqa: E712
+                    models.Account.id != master_account.id,
+                    models.Account.broker.in_(("kotak_neo", "angel_one", "groww")),
+                    models.Account.id.notin_(mirrored_child_ids))
+            .all()
+        )
+        if unmirrored_children:
+            master_kite = get_kite_client(
+                api_key=crypto_utils.decrypt(master_account.api_key_enc),
+                access_token=crypto_utils.decrypt(master_account.access_token_enc),
+            )
+            fill_instrument = _get_instrument_detail(master_kite, exchange, tradingsymbol)
+            fill_lot_size = order.get("lot_size") or (fill_instrument or {}).get("lot_size") or _guess_lot_size(tradingsymbol)
+            fill_freeze_qty = _freeze_quantity(exchange, tradingsymbol)
+            fill_product = order.get("product", "MIS")
+            with concurrent.futures.ThreadPoolExecutor(max_workers=_CHILD_REPLICATION_WORKERS) as pool:
+                futures = []
+                for child in unmirrored_children:
+                    qty = compute_child_quantity(
+                        master_qty=order.get("quantity", 0), master_capital=master_account.capital or 0.0,
+                        child_capital=child.capital or 0.0, lot_size=fill_lot_size,
+                        multiplier_override=child.multiplier_override,
+                    )
+                    if qty <= 0:
+                        log_trade_event(
+                            db, child, exchange, tradingsymbol, transaction_type, qty, "SKIPPED",
+                            "Computed replicated quantity was 0 (child capital too small for one lot).",
+                            broadcast, master_order_id=master_order_id, master_quantity=order.get("quantity", 0),
+                        )
+                        continue
+                    slices = _slice_quantity(qty, fill_lot_size, fill_freeze_qty)
+                    fill_note = f" (sliced into {len(slices)} orders to stay within the exchange freeze limit)" if len(slices) > 1 else ""
+                    futures.append(pool.submit(
+                        _replicate_one_child, child.id, exchange, tradingsymbol, transaction_type,
+                        slices, fill_product, fill_instrument, fill_note, master_order_id, broadcast,
+                    ))
+                concurrent.futures.wait(futures)
+
         for m in mirrors:
             child = db.query(models.Account).get(m.child_account_id)
             m.status = "COMPLETE"
