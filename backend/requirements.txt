@@ -9,6 +9,10 @@ sqlalchemy==2.0.52  # 2.0.30 crashes importing on Python 3.14 ("Can't replace ca
 python-dotenv==1.0.0
 requests==2.32.3
 websockets==12.0
+certifi>=2025.1.31,<2026.0.0  # growwapi>=1.5.0 requires this range; neo_api_client (below)
+# downgrades it to an ancient 2022.12.7 as a side effect of installing - re-pin this back up
+# afterward too, same drill as websockets. An outdated certifi means outdated root CA certs,
+# which can start failing real HTTPS calls over time, not just a cosmetic pip warning.
 pydantic==2.13.5  # growwapi>=1.5.0 requires >=2.10.2; fastapi==0.111.0 accepts it fine too.
 # Pinned at 2.13.5 specifically (not the 2.10.2 floor) because pydantic-core has no pre-built
 # wheel for Python 3.14 below this - anything older tries to compile from source via Rust/PyO3,
@@ -20,15 +24,20 @@ cryptography==42.0.8
 # Kotak Neo broker support. Installed from git since it's not on PyPI:
 #   pip install "git+https://github.com/Kotak-Neo/Kotak-neo-api-v2.git@v2.0.2#egg=neo_api_client"
 # NOTE: neo_api_client's setup pins websockets==8.1 (for its own live-feed subscribe() feature,
-# which this app doesn't use), conflicting with the websockets==12.0 pin above (FastAPI/uvicorn's
-# own /ws/live endpoint needs the newer version). A plain `pip install -r requirements.txt` in
-# one shot fails outright on any reasonably current pip with "ResolutionImpossible" - it won't
-# silently pick one and let you fix it after like older pip versions did. Confirmed live,
-# 2026-09: install everything else first, then neo_api_client on its own (letting it downgrade
-# websockets), then re-pin websockets back up - three separate pip invocations, e.g.:
+# which this app doesn't use) and certifi==2022.12.7, conflicting with the websockets==12.0 and
+# certifi pins above (FastAPI/uvicorn's own /ws/live endpoint needs the newer websockets;
+# growwapi needs the newer certifi). A plain `pip install -r requirements.txt` in one shot fails
+# outright on any reasonably current pip with "ResolutionImpossible" - it won't silently pick one
+# and let you fix it after like older pip versions did. Confirmed live, 2026-09: install
+# everything else first, then neo_api_client on its own (letting it downgrade both), then re-pin
+# both back up - separate pip invocations, e.g.:
 #   pip install -r <(grep -v neo_api_client requirements.txt | grep -v '^#')
 #   pip install "git+https://github.com/Kotak-Neo/Kotak-neo-api-v2.git@v2.0.2#egg=neo_api_client"
 #   pip install websockets==12.0
+#   pip install "certifi>=2025.1.31,<2026.0.0"
+# `pip check` afterward should report only neo-api-client's own two conflicting requirements
+# (websockets==8.1, certifi==2022.12.7) - harmless, since this app never uses the SDK feature
+# that needs them; any other reported conflict is a real problem worth investigating.
 neo_api_client @ git+https://github.com/Kotak-Neo/Kotak-neo-api-v2.git@v2.0.2#egg=neo_api_client
 
 # Angel One (SmartAPI) broker support - unlike Kotak Neo's SDK, this one is on PyPI.
