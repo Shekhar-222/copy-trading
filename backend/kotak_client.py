@@ -163,6 +163,52 @@ def get_profile_name(account) -> str:
     return data.get("greetingName") or "" if isinstance(data, dict) else ""
 
 
+def _safe_float(value, default: float = 1.0) -> float:
+    """Coerces a Kotak numeric-as-string field, falling back to `default` for missing/zero/
+    unparseable values - guards the PnL formula's multiplier/genNum/genDen/prcNum/prcDen
+    terms against a stray "0" or "" causing a bogus multiply-by-zero or ZeroDivisionError."""
+    try:
+        v = float(value)
+        return v if v else default
+    except (TypeError, ValueError):
+        return default
+
+
+def _fetch_ltps(client, tokens: list) -> dict:
+    """Live LTP for a batch of Kotak positions, keyed by (exSeg, tok) exactly as they appear
+    on a position row. Kotak's positions() response has no LTP field of its own (confirmed by
+    Kotak's own SDK team: github.com/Kotak-Neo/Kotak-neo-api-v2/issues/19), so it has to be
+    fetched separately via quotes(), which is capped at 50 instruments/call by the backend
+    API (not the SDK) - batched here to respect that."""
+    ltp_by_token = {}
+    for i in range(0, len(tokens), 50):
+        batch = tokens[i:i + 50]
+        resp = client.quotes(
+            instrument_tokens=[{"instrument_token": tok, "exchange_segment": seg} for seg, tok in batch],
+            quote_type="ltp",
+        )
+        rows = resp if isinstance(resp, list) else []
+        for row in rows:
+            if not isinstance(row, dict):
+                continue
+            try:
+                ltp_by_token[(row.get("exchange"), str(row.get("exchange_token")))] = float(row.get("ltp") or 0)
+            except (TypeError, ValueError):
+                continue
+    return ltp_by_token
+
+
+def _unrealized_leg(p: dict, net_qty: float, ltp: float) -> float:
+    """The mark-to-market term of Kotak's documented PnL formula (docs/Positions.md):
+    Net Qty * LTP * multiplier * (genNum/genDen) * (prcNum/prcDen)."""
+    multiplier = _safe_float(p.get("multiplier"))
+    gen_num = _safe_float(p.get("genNum"))
+    gen_den = _safe_float(p.get("genDen"))
+    prc_num = _safe_float(p.get("prcNum"))
+    prc_den = _safe_float(p.get("prcDen"))
+    return net_qty * ltp * multiplier * (gen_num / gen_den) * (prc_num / prc_den)
+
+
 def get_positions(account) -> list:
     """
     Open and closed (squared-off today) positions for the dashboard's positions panel. Net
@@ -170,6 +216,11 @@ def get_positions(account) -> list:
     against a live account: a NIFTY position's flBuyQty/flSellQty matched lots * lotSz exactly.
     Closed positions (net 0) are kept, not dropped, so realized P&L from today's squared-off
     trades is still visible - same as how Zerodha's positions() keeps those rows too.
+
+    PnL for OPEN rows follows Kotak's documented formula (realized leg + unrealized
+    mark-to-market via a live LTP fetch) - see get_pnl()'s docstring for why the unrealized
+    leg matters. CLOSED rows have net qty 0 so the unrealized leg is naturally zero and the
+    realized-only figure is already correct, same as before.
     """
     try:
         client = _client_for(account)
@@ -177,11 +228,35 @@ def get_positions(account) -> list:
         rows = positions.get("data") if isinstance(positions, dict) else positions
         if not isinstance(rows, list):
             return []
-        out = []
+
+        parsed = []
+        open_tokens = []
         for p in rows:
             buy_qty = float(p.get("cfBuyQty", 0) or 0) + float(p.get("flBuyQty", 0) or 0)
             sell_qty = float(p.get("cfSellQty", 0) or 0) + float(p.get("flSellQty", 0) or 0)
             net_qty = buy_qty - sell_qty
+            buy_amt = float(p.get("cfBuyAmt", 0) or 0) + float(p.get("buyAmt", 0) or 0)
+            sell_amt = float(p.get("cfSellAmt", 0) or 0) + float(p.get("sellAmt", 0) or 0)
+            avg_price = (buy_amt / buy_qty) if buy_qty else (sell_amt / sell_qty if sell_qty else 0)
+            parsed.append((p, net_qty, sell_amt - buy_amt))
+            if net_qty and p.get("tok") and p.get("exSeg"):
+                open_tokens.append((p.get("exSeg"), str(p.get("tok"))))
+
+        ltp_by_token = {}
+        if open_tokens:
+            try:
+                ltp_by_token = _fetch_ltps(client, open_tokens)
+            except Exception:  # noqa: BLE001
+                pass  # unrealized leg is best-effort; realized pnl below is still shown
+
+        out = []
+        for p, net_qty, realized in parsed:
+            pnl = realized
+            ltp = ltp_by_token.get((p.get("exSeg"), str(p.get("tok"))))
+            if net_qty and ltp is not None:
+                pnl += _unrealized_leg(p, net_qty, ltp)
+            buy_qty = float(p.get("cfBuyQty", 0) or 0) + float(p.get("flBuyQty", 0) or 0)
+            sell_qty = float(p.get("cfSellQty", 0) or 0) + float(p.get("flSellQty", 0) or 0)
             buy_amt = float(p.get("cfBuyAmt", 0) or 0) + float(p.get("buyAmt", 0) or 0)
             sell_amt = float(p.get("cfSellAmt", 0) or 0) + float(p.get("sellAmt", 0) or 0)
             avg_price = (buy_amt / buy_qty) if buy_qty else (sell_amt / sell_qty if sell_qty else 0)
@@ -190,7 +265,7 @@ def get_positions(account) -> list:
                 "exchange": p.get("exSeg"),
                 "quantity": int(net_qty),
                 "average_price": round(avg_price, 2),
-                "pnl": round(sell_amt - buy_amt, 2),
+                "pnl": round(pnl, 2),
                 "product": p.get("prod"),
                 "status": "OPEN" if net_qty != 0 else "CLOSED",
             })
@@ -201,11 +276,21 @@ def get_positions(account) -> list:
 
 def get_pnl(account):
     """
-    Best-effort running P&L for a Kotak Neo account. Kotak's positions() response doesn't
-    return a ready-made PnL figure the way Kite's does - it has to be derived from buy/sell
-    amount fields per Kotak's docs, and only the realized buy/sell-amount delta is computed
-    here (no live LTP fetch for the unrealized mark-to-market leg). Returns None (shown as
-    "-" in the dashboard) if positions can't be fetched, rather than risk a wrong number.
+    Best-effort running P&L for a Kotak Neo account, following Kotak's own documented formula
+    (docs/Positions.md): (Total Sell Amt - Total Buy Amt) + (Net Qty * LTP * multiplier *
+    (genNum/genDen) * (prcNum/prcDen)). The first term is realized cash-flow; the second is
+    the unrealized mark-to-market leg for whatever's still open, which needs a live LTP -
+    Kotak's positions() response doesn't include one (confirmed by Kotak's own SDK team:
+    github.com/Kotak-Neo/Kotak-neo-api-v2/issues/19), so it's fetched separately via quotes().
+
+    Previously this function only computed the first (realized) term, which is exactly why
+    the figure looked wrong while a position was open live and "corrected itself" once the
+    position closed - net qty hits 0 at that point, so the missing unrealized leg was zero
+    anyway and the bug was invisible.
+
+    The unrealized leg is wrapped in its own try/except so a quotes() failure (rate limit,
+    network blip) degrades to realized-only P&L instead of losing the figure entirely -
+    still returns None only when positions() itself can't be fetched.
     """
     try:
         client = _client_for(account)
@@ -215,11 +300,30 @@ def get_pnl(account):
             return None
         if not rows:
             return 0.0
+
         total = 0.0
+        open_rows = []
         for p in rows:
+            buy_qty = float(p.get("cfBuyQty", 0) or 0) + float(p.get("flBuyQty", 0) or 0)
+            sell_qty = float(p.get("cfSellQty", 0) or 0) + float(p.get("flSellQty", 0) or 0)
+            net_qty = buy_qty - sell_qty
             buy_amt = float(p.get("cfBuyAmt", 0) or 0) + float(p.get("buyAmt", 0) or 0)
             sell_amt = float(p.get("cfSellAmt", 0) or 0) + float(p.get("sellAmt", 0) or 0)
             total += sell_amt - buy_amt
+            if net_qty and p.get("tok") and p.get("exSeg"):
+                open_rows.append((p, net_qty))
+
+        if open_rows:
+            try:
+                tokens = [(p.get("exSeg"), str(p.get("tok"))) for p, _ in open_rows]
+                ltp_by_token = _fetch_ltps(client, tokens)
+                for p, net_qty in open_rows:
+                    ltp = ltp_by_token.get((p.get("exSeg"), str(p.get("tok"))))
+                    if ltp is not None:
+                        total += _unrealized_leg(p, net_qty, ltp)
+            except Exception:  # noqa: BLE001
+                pass  # unrealized leg is best-effort; realized total above is still meaningful
+
         return total
     except Exception:  # noqa: BLE001
         return None
