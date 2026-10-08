@@ -37,9 +37,13 @@ from trade_log import log_trade_event
 
 MARKET_PROTECTION_PCT = 5  # matches replication_engine's and kotak_client's Zerodha/Kotak buffer
 
-_EXCHANGE = {"NSE": "NSE", "BSE": "BSE", "NFO": "NFO", "BFO": "BFO", "MCX": "MCX", "CDS": "CDS"}
+_EXCHANGE = {"NSE": "NSE", "BSE": "BSE", "NFO": "NFO", "BFO": "BFO", "MCX": "MCX", "NCO": "NCO", "CDS": "CDS"}
 _TRANSACTION_TYPE = {"BUY": "BUY", "SELL": "SELL"}
 _PRODUCT_TYPE = {"MIS": "INTRADAY", "CNC": "DELIVERY", "NRML": "CARRYFORWARD"}
+# NCO (NSE commodity) futures are typed by commodity class in Angel's scrip master rather than
+# MCX's single FUTCOM - FUTBLN (bullion), FUTENR (energy), FUTBAS (base metals) - confirmed
+# against the cached scrip master, 2026-10.
+_FUTURE_TYPES = {"FUTIDX", "FUTSTK", "FUTCUR", "FUTCOM", "FUTBLN", "FUTENR", "FUTBAS"}
 _OPEN_ORDER_STATUSES = {"open", "pending", "trigger pending", "modified", "open pending", "validation pending"}
 
 # Angel's public scrip master - a single JSON dump covering every exchange/segment, not a
@@ -124,18 +128,29 @@ def _client_for(account) -> object:
     )
 
 
+def _row_tick_size(row: dict) -> float:
+    """Tick size in rupees. Angel's scrip master stores it in paise ("5.000000" = 0.05 for NSE
+    equity/F&O) - commodity contracts tick much coarser (NCO gold futures: "100.000000" = Re 1),
+    so a fixed 0.05 snap would price those off-tick and get them rejected."""
+    try:
+        tick = float(row.get("tick_size") or 0) / 100
+    except (TypeError, ValueError):
+        tick = 0
+    return tick if tick > 0 else 0.05
+
+
 def _resolve_equity(exchange_segment: str, tradingsymbol: str) -> tuple:
-    """Returns (angel_trading_symbol, symboltoken, lot_size) for a cash-market equity symbol."""
+    """Returns (angel_trading_symbol, symboltoken, lot_size, tick_size) for a cash-market equity symbol."""
     by_exch_name = _load_instrument_master()
     rows = by_exch_name.get((exchange_segment, tradingsymbol.upper()), [])
     for row in rows:
         if str(row.get("symbol", "")).upper() == f"{tradingsymbol.upper()}-EQ":
-            return row["symbol"], row["token"], int(float(row.get("lotsize") or 1))
+            return row["symbol"], row["token"], int(float(row.get("lotsize") or 1)), _row_tick_size(row)
     raise ValueError(f"Could not find a matching Angel One equity scrip for {tradingsymbol} on {exchange_segment}.")
 
 
 def _resolve_fo(exchange_segment: str, instrument: dict) -> tuple:
-    """Returns (angel_trading_symbol, symboltoken, lot_size) for an F&O contract, resolved from
+    """Returns (angel_trading_symbol, symboltoken, lot_size, tick_size) for an F&O contract, resolved from
     Kite's structured instrument fields (underlying/expiry/strike/type) rather than by parsing
     Kite's own tradingsymbol string. Angel's scrip master stores expiry as "DDMMMYYYY" (e.g.
     "28MAR2024", same format Kotak uses) and strike as rupees*100 as a string, per public docs."""
@@ -168,9 +183,9 @@ def _resolve_fo(exchange_segment: str, instrument: dict) -> tuple:
                 continue
             if row_strike != strike_key:
                 continue
-        elif row_type not in ("FUTIDX", "FUTSTK", "FUTCUR", "FUTCOM"):
+        elif row_type not in _FUTURE_TYPES:
             continue
-        return row["symbol"], row["token"], int(float(row.get("lotsize") or 1))
+        return row["symbol"], row["token"], int(float(row.get("lotsize") or 1)), _row_tick_size(row)
     raise ValueError(
         f"Could not find a matching Angel One contract for {name} {expiry_str} {strike} {option_type} "
         f"on {exchange_segment}."
@@ -185,13 +200,13 @@ def _ltp(client, exchange_segment: str, tradingsymbol: str, symboltoken: str) ->
 
 
 def _protected_limit_price(client, exchange_segment: str, tradingsymbol: str, symboltoken: str,
-                            transaction_type: str) -> float:
+                            transaction_type: str, tick_size: float = 0.05) -> float:
     """Same market-protection technique as replication_engine._protected_limit_price - see
     module docstring for why plain MARKET isn't used here."""
     ltp = _ltp(client, exchange_segment, tradingsymbol, symboltoken)
     buffer = ltp * (MARKET_PROTECTION_PCT / 100)
     raw_price = ltp + buffer if transaction_type == "BUY" else ltp - buffer
-    return round(raw_price * 20) / 20  # snap to the 0.05 tick size
+    return round(round(raw_price / tick_size) * tick_size, 2)
 
 
 def place_child_order(account, exchange: str, tradingsymbol: str, transaction_type: str,
@@ -206,9 +221,9 @@ def place_child_order(account, exchange: str, tradingsymbol: str, transaction_ty
 
     client = _client_for(account)
     if instrument is not None:
-        angel_symbol, symboltoken, lot_size = _resolve_fo(exchange_segment, instrument)
+        angel_symbol, symboltoken, lot_size, tick_size = _resolve_fo(exchange_segment, instrument)
     else:
-        angel_symbol, symboltoken, lot_size = _resolve_equity(exchange_segment, tradingsymbol)
+        angel_symbol, symboltoken, lot_size, tick_size = _resolve_equity(exchange_segment, tradingsymbol)
 
     if lot_size and quantity % lot_size != 0:
         # quantity is computed upstream in replication_engine.py from the MASTER's (Kite) lot
@@ -227,7 +242,8 @@ def place_child_order(account, exchange: str, tradingsymbol: str, transaction_ty
         )
 
     angel_txn_type = _TRANSACTION_TYPE.get(transaction_type, transaction_type)
-    limit_price = _protected_limit_price(client, exchange_segment, angel_symbol, symboltoken, angel_txn_type)
+    limit_price = _protected_limit_price(client, exchange_segment, angel_symbol, symboltoken, angel_txn_type,
+                                        tick_size)
 
     resp = client.placeOrder({
         "variety": "NORMAL",

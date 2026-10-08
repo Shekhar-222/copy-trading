@@ -812,7 +812,7 @@ def _protected_limit_price(kite, exchange: str, tradingsymbol: str, transaction_
 
 
 # Exchanges where lot size actually matters (equity is always 1, so skip the network round trip there).
-_LOT_SIZE_EXCHANGES = {"NFO", "BFO", "MCX", "CDS"}
+_LOT_SIZE_EXCHANGES = {"NFO", "BFO", "MCX", "NCO", "CDS"}  # NCO = NSE commodity derivatives
 _INSTRUMENT_CACHE_TTL = datetime.timedelta(hours=12)
 _instrument_details = {}            # (exchange, tradingsymbol) -> full instrument dict from kite.instruments()
 _instrument_cache_loaded_at = {}    # exchange -> datetime last refreshed

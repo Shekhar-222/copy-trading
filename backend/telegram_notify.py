@@ -29,7 +29,7 @@ _INTERVAL_SECONDS = 60
 # making sense too. Manual offset (not zoneinfo) to match the rest of the codebase's IST handling
 # (see trade_log.today_ist_start_utc).
 _NSE_CLOSE_IST = datetime.time(15, 30)
-# MCX (commodity) trades well past NSE's close - evening session runs until ~23:30 IST. Only
+# MCX/NCO (commodity) trades well past NSE's close - evening session runs until ~23:30 IST. Only
 # used as today's cutoff if an MCX trade actually happened today (see _market_close_ist), so a
 # normal NSE-only day doesn't keep sending digests for 8 pointless extra hours.
 _MCX_CLOSE_IST = datetime.time(23, 30)
@@ -42,7 +42,7 @@ _last_log_id_sent = 0
 def _market_close_ist(db) -> datetime.time:
     has_mcx_today = (
         db.query(models.TradeLog)
-        .filter(models.TradeLog.timestamp >= trade_log.today_ist_start_utc(), models.TradeLog.exchange == "MCX")
+        .filter(models.TradeLog.timestamp >= trade_log.today_ist_start_utc(), models.TradeLog.exchange.in_(("MCX", "NCO")))
         .first()
     )
     return _MCX_CLOSE_IST if has_mcx_today else _NSE_CLOSE_IST

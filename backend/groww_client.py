@@ -58,8 +58,8 @@ from trade_log import log_trade_event
 # exchange "NFO") hit an unmapped lookup and was rejected locally before ever reaching Groww's
 # API - confirmed live, 2026-07-24 (the same order placed manually on Groww's own app went
 # through fine, proving it wasn't a real restriction on Groww's side, just a mapping gap here).
-_EXCHANGE = {"NSE": "NSE", "BSE": "BSE", "NFO": "NSE", "BFO": "BSE", "CDS": "NSE", "MCX": "MCX"}
-_SEGMENT = {"NSE": "CASH", "BSE": "CASH", "NFO": "FNO", "BFO": "FNO", "CDS": "CURRENCY", "MCX": "COMMODITY"}
+_EXCHANGE = {"NSE": "NSE", "BSE": "BSE", "NFO": "NSE", "BFO": "BSE", "CDS": "NSE", "MCX": "MCX", "NCO": "NSE"}
+_SEGMENT = {"NSE": "CASH", "BSE": "CASH", "NFO": "FNO", "BFO": "FNO", "CDS": "CURRENCY", "MCX": "COMMODITY", "NCO": "COMMODITY"}
 _PRODUCT_TYPE = {"MIS": "MIS", "CNC": "CNC", "NRML": "NRML"}
 _TRANSACTION_TYPE = {"BUY": "BUY", "SELL": "SELL"}
 _ORDER_REJECTED_STATUSES = {"rejected", "failed"}
@@ -264,7 +264,7 @@ def place_child_order(account, exchange: str, tradingsymbol: str, transaction_ty
         # Not something this app can work around - needs Groww to add API support. Fail with this
         # clear explanation immediately instead of spending a round trip on Groww's generic error.
         raise ValueError(
-            "Groww's trading API doesn't support commodity (MCX) order placement yet - this "
+            f"Groww's trading API doesn't support commodity ({exchange}) order placement yet - this "
             "works fine on Groww's own app, but not through the API this account trades via."
         )
 

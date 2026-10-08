@@ -92,6 +92,10 @@ def place_child_order(account, exchange: str, tradingsymbol: str, transaction_ty
     is the full Kite instrument record (see replication_engine._get_instrument_detail) when
     the trade is F&O, None for equity."""
     exchange_segment = _EXCHANGE_SEGMENT.get(exchange)
+    if exchange == "NCO":
+        # Kotak Neo's SDK has no NSE commodity segment at all (neo_api_client/settings.py lists
+        # only mcx_fo for commodities), so there's nothing to map NCO onto.
+        raise ValueError("Kotak Neo's trading API doesn't support NSE commodity (NCO) orders.")
     if not exchange_segment:
         raise ValueError(f"Kotak Neo child accounts don't support exchange {exchange!r} yet.")
 
