@@ -45,6 +45,14 @@ _PRODUCT_TYPE = {"MIS": "INTRADAY", "CNC": "DELIVERY", "NRML": "CARRYFORWARD"}
 # against the cached scrip master, 2026-10.
 _FUTURE_TYPES = {"FUTIDX", "FUTSTK", "FUTCUR", "FUTCOM", "FUTBLN", "FUTENR", "FUTBAS"}
 _OPEN_ORDER_STATUSES = {"open", "pending", "trigger pending", "modified", "open pending", "validation pending"}
+# Commodity exchanges where Kite and Angel count order quantity in different units. Kite's MCX
+# quantity is a number of LOTS (its instrument dump reports lot_size=1 for every MCX contract),
+# while Angel's is in the contract's trading unit, a whole multiple of its scrip master
+# "lotsize" (CRUDEOIL 100, NATURALGAS 1250, GOLDM 100, SILVERM 5, ...). Confirmed by matching
+# every MCX/NCO future and option in both brokers' instrument dumps, 2026-10: every MCX contract
+# was Kite 1 vs. Angel N, and every NCO contract was 1 vs. 1 (so the conversion is a no-op
+# there, but harmless if either broker ever changes NCO's convention).
+_LOT_COUNT_EXCHANGES = {"MCX", "NCO"}
 
 # Angel's public scrip master - a single JSON dump covering every exchange/segment, not a
 # live search API. This file is genuinely large (~33MB, confirmed live), so it's cached both
@@ -225,14 +233,16 @@ def place_child_order(account, exchange: str, tradingsymbol: str, transaction_ty
     else:
         angel_symbol, symboltoken, lot_size, tick_size = _resolve_equity(exchange_segment, tradingsymbol)
 
+    if exchange_segment in _LOT_COUNT_EXCHANGES:
+        quantity = _commodity_quantity(quantity, instrument, lot_size, angel_symbol)
+
     if lot_size and quantity % lot_size != 0:
         # quantity is computed upstream in replication_engine.py from the MASTER's (Kite) lot
         # size, shared across every child - normally correct since exchanges set lot sizes
-        # centrally, not brokers, but Kite's instrument data can be stale for a given contract
-        # (confirmed live, 2026-09, for an MCX contract: Kite reported lot_size=1 while the real
-        # exchange-mandated lot size was 10, matching what Kotak Neo's own live resolution
-        # returned). Same mismatch risk applies here - fail loudly with the real numbers instead
-        # of risking a silently mis-sized order.
+        # centrally, not brokers, but Kite's instrument data can be stale for a given contract.
+        # (Kite's MCX lot_size=1 is NOT this case - that's Kite counting MCX quantity in lots,
+        # already converted above via _commodity_quantity.) Fail loudly with the real numbers
+        # instead of risking a silently mis-sized order.
         raise ValueError(
             f"Angel One's own lot size for {angel_symbol} is {lot_size}, but was asked to place "
             f"{quantity} - not a whole multiple. This usually means Kite's instrument data has a "
@@ -245,7 +255,10 @@ def place_child_order(account, exchange: str, tradingsymbol: str, transaction_ty
     limit_price = _protected_limit_price(client, exchange_segment, angel_symbol, symboltoken, angel_txn_type,
                                         tick_size)
 
-    resp = client.placeOrder({
+    # placeOrderFullResponse, not placeOrder: same endpoint, but placeOrder() swallows Angel's
+    # error and returns None, so a rejection (confirmed live: AG7002 "... is not a registered
+    # IP") surfaced only as "did not return an order id: None". This returns the error body.
+    resp = client.placeOrderFullResponse({
         "variety": "NORMAL",
         "tradingsymbol": angel_symbol,
         "symboltoken": symboltoken,
@@ -268,10 +281,26 @@ def place_child_order(account, exchange: str, tradingsymbol: str, transaction_ty
     elif isinstance(resp, dict):
         order_id = resp.get("data", {}).get("orderid") if isinstance(resp.get("data"), dict) else resp.get("orderid")
     if not order_id:
+        if isinstance(resp, dict) and resp.get("message"):
+            raise ValueError(f"Angel One rejected the order: {resp['message']} ({resp.get('errorCode') or 'no code'})")
         raise ValueError(f"Angel One did not return an order id: {resp}")
 
     _raise_if_rejected(client, order_id)
     return order_id
+
+
+def _commodity_quantity(kite_quantity: int, instrument: dict, angel_lot_size: int, angel_symbol: str) -> int:
+    """Translates a Kite commodity quantity into Angel's units: Kite quantity -> whole lots (via
+    Kite's own lot_size, 1 on MCX) -> Angel quantity (lots x Angel's lotsize). Going through the
+    lot count, not a fixed multiplier, keeps this right even if Kite starts reporting MCX in
+    units. See _LOT_COUNT_EXCHANGES for the confirmed per-broker conventions."""
+    kite_lot_size = int((instrument or {}).get("lot_size") or 1)
+    if kite_quantity % kite_lot_size != 0:
+        raise ValueError(
+            f"Quantity {kite_quantity} for {angel_symbol} is not a whole number of Kite lots "
+            f"(Kite lot size {kite_lot_size}) - refusing to guess the Angel One lot count."
+        )
+    return (kite_quantity // kite_lot_size) * (angel_lot_size or 1)
 
 
 def _raise_if_rejected(client, order_id: str) -> None:
